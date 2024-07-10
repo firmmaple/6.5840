@@ -21,9 +21,9 @@ const (
 
 var ll_desc = []string{"DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"}
 
-var defaultLogger = NewLogger(LL_DEBUG, os.Stdout, "")
+// var defaultLogger = NewLogger(LL_DEBUG, os.Stdout, "")
 // var defaultLogger = NewLogger(LL_INFO, os.Stdout, "")
-// var defaultLogger = NewLogger(LL_WARN, os.Stdout, "")
+var defaultLogger = NewLogger(LL_WARN, os.Stdout, "")
 
 const (
 	LT_Client  LogTopic = "CLNT"
@@ -58,8 +58,8 @@ func NewLogger(level LogLevel, out io.Writer, prefix string) *Logger {
 }
 
 func (l *Logger) buildPrefix(level LogLevel, topic LogTopic) string {
-	time := time.Since(l.debugStart).Microseconds()
-	time /= 100
+	time := time.Since(l.debugStart).Milliseconds()
+	// time /= 100
 	prefix := fmt.Sprintf("[%v] %06d ", ll_desc[level], time)
 	if l.prefix != "" {
 		prefix = fmt.Sprintf("%v%v ", prefix, l.prefix)
