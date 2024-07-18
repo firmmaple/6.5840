@@ -574,8 +574,22 @@ func (rf *Raft) replicate(
 	finishedClient <- client
 }
 
-func (rf *Raft) campaign() {
+// return false if there is no need to start an election
+// else start an election and return true
+func (rf *Raft) startElection() bool {
 	rf.mu.Lock()
+	// Q：为什么要把检查条件放在startElection函数，而不是ticker函数里呢？
+	// 似乎放在ticker函数里检查更符合直觉？
+	// A：我最初就是这么做的，但是这样会出现一个bug，
+	// 假设此刻server N 符合选举条件，但是尚未进入startElection函数执行选举代码
+	// 这时另一个server M开始选举，而N将票投给了M
+	// 这时M才开始执行startElection的代码，然后bug就发生了，
+	// 在这一term中，M既作为follower投了票，又充当candidate参与选举
+	if rf.hasReceivedMsg || rf.eState == LEADER {
+		rf.mu.Unlock()
+		return false
+	}
+
 	rf.voteCount = 0
 	rf.currentTerm++
 	rf.eState = CANDIDATE
@@ -672,6 +686,8 @@ func (rf *Raft) campaign() {
 			}
 		}(i)
 	}
+
+	return true
 }
 
 func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
@@ -845,10 +861,10 @@ func (rf *Raft) ticker() {
 		// logger.Trace(logger.LT_Timer, "%%%d attempt tick\n", rf.me)
 		rf.mu.Lock()
 		logger.Trace(logger.LT_Timer, "%%%d tick on term %d\n", rf.me, rf.currentTerm)
-		if !rf.hasReceivedMsg && rf.eState != LEADER {
-			rf.mu.Unlock()
-			rf.campaign()
-		} else {
+		rf.mu.Unlock()
+
+		if !rf.startElection() { // 检查是否有必要选举
+			rf.mu.Lock()
 			rf.hasReceivedMsg = false
 			rf.mu.Unlock()
 		}
