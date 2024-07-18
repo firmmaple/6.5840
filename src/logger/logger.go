@@ -12,33 +12,38 @@ type LogLevel int
 type LogTopic string
 
 const (
-	LL_DEBUG LogLevel = iota
+	LL_ALL LogLevel = iota
+	LL_TRACE
+	LL_DEBUG
 	LL_INFO
 	LL_WARN
 	LL_ERROR
 	LL_FATAL
 )
 
-var ll_desc = []string{"DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"}
+var ll_desc = []string{"ALL", "TRACE", "DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"}
 
+var defaultLogger = NewLogger(LL_TRACE, os.Stdout, "")
 // var defaultLogger = NewLogger(LL_DEBUG, os.Stdout, "")
 // var defaultLogger = NewLogger(LL_INFO, os.Stdout, "")
-var defaultLogger = NewLogger(LL_WARN, os.Stdout, "")
+// var defaultLogger = NewLogger(LL_WARN, os.Stdout, "")
 
 const (
-	LT_Client  LogTopic = "CLNT"
-	LT_Commit  LogTopic = "CMIT"
-	LT_Drop    LogTopic = "DROP"
-	LT_Leader  LogTopic = "LEAD"
-	LT_Log     LogTopic = "LOG1"
-	LT_Log2    LogTopic = "LOG2"
-	LT_Persist LogTopic = "PERS"
-	LT_Snap    LogTopic = "SNAP"
-	LT_Term    LogTopic = "TERM"
-	LT_Test    LogTopic = "TEST"
-	LT_Timer   LogTopic = "TIMR"
-	LT_Trace   LogTopic = "TRCE"
-	LT_Vote    LogTopic = "VOTE"
+	LT_Client    LogTopic = "CLNT"
+	LT_Commit    LogTopic = "CMIT"
+	LT_Drop      LogTopic = "DROP"
+	LT_Leader    LogTopic = "LEAD"
+	LT_Candidate LogTopic = "CAND"
+	LT_Log       LogTopic = "LOG1"
+	LT_Log2      LogTopic = "LOG2"
+	LT_Persist   LogTopic = "PERS"
+	LT_Snap      LogTopic = "SNAP"
+	LT_Term      LogTopic = "TERM"
+	LT_Test      LogTopic = "TEST"
+	LT_Timer     LogTopic = "TIMR"
+	LT_Trace     LogTopic = "TRCE"
+	LT_Vote      LogTopic = "VOTE"
+	LT_APPLIER   LogTopic = "APLY"
 )
 
 type Logger struct {
@@ -77,22 +82,15 @@ func (l *Logger) log(level LogLevel, topic LogTopic, format string, args ...inte
 		return
 	}
 
-	// time := time.Since(l.debugStart).Microseconds()
-	// time /= 100
-	// prefix := fmt.Sprintf("[%v] %06d ", ll_desc[level], time)
-	// if l.prefix != "" {
-	// 	prefix = fmt.Sprintf("%v%v ", prefix, l.prefix)
-	// }
-	// if topic != "" {
-	// 	prefix = fmt.Sprintf("%v%v  ", prefix, topic)
-	// } else {
-	// 	prefix = fmt.Sprintf("%v      ", prefix)
-	// }
 	prefix := l.buildPrefix(level, topic)
 
 	msg := fmt.Sprintf(format, args...)
 	msg = prefix + msg
 	fmt.Print(msg)
+}
+
+func (l *Logger) Trace(topic LogTopic, format string, args ...interface{}) {
+	l.log(LL_TRACE, topic, format, args...)
 }
 
 func (l *Logger) Debug(topic LogTopic, format string, args ...interface{}) {
@@ -115,6 +113,10 @@ func (l *Logger) Error(topic LogTopic, format string, args ...interface{}) {
 func (l *Logger) Fatal(topic LogTopic, format string, args ...interface{}) {
 	defer os.Exit(1)
 	l.log(LL_FATAL, topic, format, args...)
+}
+
+func Trace(topic LogTopic, format string, args ...interface{}) {
+	defaultLogger.log(LL_TRACE, topic, format, args...)
 }
 
 func Info(topic LogTopic, format string, args ...interface{}) {
@@ -142,6 +144,10 @@ func (l *Logger) SimpleLog(level LogLevel, topic LogTopic, message interface{}) 
 }
 
 // 全局函数用于简单日志输出
+func Traceln(topic LogTopic, message interface{}) {
+	defaultLogger.SimpleLog(LL_TRACE, topic, message)
+}
+
 func Debugln(topic LogTopic, message interface{}) {
 	defaultLogger.SimpleLog(LL_DEBUG, topic, message)
 }
