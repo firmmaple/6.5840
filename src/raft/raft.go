@@ -83,13 +83,16 @@ type Raft struct {
 	eState         electionState
 
 	Log         []logEntry // log entries
-	index       int
-	commitIndex int   // index of highest log entry known to be committed (initialized to 0)
-	lastAppiled int   // index of highest log entry applied to state machine (initialized to 0)
-	nextIndex   []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	matchIndex  []int // for each server, index of highest log entry known to be replicated on server (initialized to 0)
+	commitIndex int        // index of highest log entry known to be committed (initialized to 0)
+	lastAppiled int        // index of highest log entry applied to state machine (initialized to 0)
+	nextIndex   []int      // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex  []int      // for each server, index of highest log entry known to be replicated on server (initialized to 0)
 	cond        sync.Cond
 	applyCh     chan ApplyMsg
+
+	snapshot      []byte
+	snapshotIndex int
+	snapshotTerm  int
 }
 
 // return currentTerm and whether this server
@@ -105,14 +108,67 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+// hasTerm 从给定索引index开始向前搜索服务器日志，寻找具有指定任期term的条目。
+// 如果找到，返回该日志条目的索引；如果没有找到，返回 -1。
 func (rf *Raft) hasTerm(term int, index int) int {
-	for i := index; i > 0; i-- {
-		if rf.Log[i].Term == term {
+	for i := index; i > rf.snapshotIndex; i-- {
+		if rf.logAtIndex(i).Term == term {
 			return i
 		}
 	}
 
+	if rf.snapshotTerm == term {
+		return rf.snapshotIndex
+	}
+
 	return -1
+}
+
+func (rf *Raft) logLength() int {
+	return rf.snapshotIndex + 1 + len(rf.Log)
+}
+
+func (rf *Raft) logAtIndex(index int) logEntry {
+	if index-rf.snapshotLength() < 0 || index-rf.snapshotLength() >= len(rf.Log) {
+		logger.Warn(
+			logger.LT_Log,
+			"%%%d: log index out of range - index: %d, snapshot length: %d\n",
+			rf.me, index, rf.snapshotLength(),
+		)
+	}
+	return rf.Log[index-rf.snapshotLength()]
+}
+
+func (rf *Raft) logSlice(start int, end int) []logEntry {
+	// logger.Trace(
+	// 	logger.LT_Log,
+	// 	"%d: before slice start: %d, end: %d, ss length %d\n",
+	// 	rf.me, start, end, rf.snapshotLength(),
+	// )
+	// 正确范围应当是
+	// snapshotLength <= start <= end <= logLength
+	// 调整 start 和 end 确保它们位于快照之后的有效范围内
+	if start < rf.snapshotLength() {
+		start = rf.snapshotLength()
+	}
+	if end == -1 || end > rf.logLength() {
+		end = rf.logLength()
+	}
+
+	// 转换 start 和 end 以对应于 Log 切片的实际索引
+	start -= rf.snapshotLength()
+	end -= rf.snapshotLength()
+	// 防止反向切片
+	if start > end {
+		start = end
+	}
+
+	// logger.Trace(logger.LT_Log, "%d: after slice start: %d, end: %d\n", rf.me, start, end)
+	return rf.Log[start:end]
+}
+
+func (rf *Raft) snapshotLength() int {
+	return rf.snapshotIndex + 1
 }
 
 // save Raft's persistent state to stable storage,
@@ -126,21 +182,27 @@ func (rf *Raft) persist() {
 	// Your code here (3C).
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	err1 := e.Encode(rf.CurrentTerm)
-	err2 := e.Encode(rf.VotedFor)
-	err3 := e.Encode(rf.Log)
-	if err1 != nil || err2 != nil || err3 != nil {
-		logger.Error(
-			logger.LT_Persist, "%d: error in encoding - currentTerm: %v, votedFor: %v, log: %v\n",
-			rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log,
-		)
+	// err1 := e.Encode(rf.CurrentTerm)
+	// err2 := e.Encode(rf.VotedFor)
+	// err3 := e.Encode(rf.Log)
+	// err4 := e.Encode(rf.snapshotIndex)
+	// err5 := e.Encode(rf.snapshotTerm)
+	// if err1 != nil || err2 != nil || err3 != nil {
+	// 	logger.Error(
+	// 		logger.LT_Persist, "%d: error in encoding - currentTerm: %v, votedFor: %v, log: %v\n",
+	// 		rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log,
+	// 	)
+	// }
+	if e.Encode(rf.CurrentTerm) != nil || e.Encode(rf.VotedFor) != nil || e.Encode(rf.Log) != nil ||
+		e.Encode(rf.snapshotIndex) != nil || e.Encode(rf.snapshotTerm) != nil {
+		logger.Errorln(logger.LT_Persist, "Failed to encode some fields")
 	}
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot)
 	logger.Trace(
 		logger.LT_Persist,
-		"%%%d successfully persist state - currentTerm: %d, votedFor: %d, log length: %d\n",
-		rf.me, rf.CurrentTerm, rf.VotedFor, len(rf.Log),
+		"%%%d successfully persist state - Term %d, votedFor %d, log len %d, sIndex %d, sTerm %d\n",
+		rf.me, rf.CurrentTerm, rf.VotedFor, rf.logLength(), rf.snapshotIndex, rf.snapshotTerm,
 	)
 }
 
@@ -155,22 +217,22 @@ func (rf *Raft) readPersist(data []byte) {
 	currentTerm := -1
 	votedFor := -2
 	var log []logEntry
-	if d.Decode(&currentTerm) != nil ||
-		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil ||
+		d.Decode(&rf.snapshotIndex) != nil || d.Decode(&rf.snapshotTerm) != nil {
 		logger.Error(
 			logger.LT_Persist,
 			"%%%d: error in decoding - currentTerm: %d, votedFor: %d, log length: %d\n",
-			rf.me, currentTerm, votedFor, len(log),
+			rf.me, currentTerm, votedFor, rf.logLength(),
 		)
 	} else {
 		rf.CurrentTerm = currentTerm
 		rf.VotedFor = votedFor
 		rf.Log = log
+		rf.snapshot = rf.persister.ReadSnapshot()
 		logger.Trace(
 			logger.LT_Persist,
 			"%%%d successfully read state - currentTerm: %d, votedFor: %d, log length: %d\n",
-			rf.me, currentTerm, votedFor, len(log),
+			rf.me, currentTerm, votedFor, rf.logLength(),
 		)
 	}
 }
@@ -181,6 +243,25 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+	logger.Debug(
+		logger.LT_Snap,
+		"%%%d attempt to create a snapshot up to index %d(last index %d) on term %d\n",
+		rf.me, index, rf.logLength()-1, rf.CurrentTerm,
+	)
+	// 下面三行代码顺序非常重要，不能变动
+	rf.snapshotTerm = rf.logAtIndex(index).Term
+	rf.Log = rf.logSlice(index+1, -1)
+	rf.snapshotIndex = index
+	rf.snapshot = snapshot
+
+	// logger.Trace(
+	// 	logger.LT_Snap,
+	// 	"%%%d: after snapshot - snapshotTerm %d, snapshotIndex %d, log length %d\n",
+	// 	rf.me, rf.snapshotTerm, rf.snapshotIndex, len(rf.Log),
+	// )
 }
 
 // example RequestVote RPC arguments structure.
@@ -218,6 +299,20 @@ type AppendEntriesReply struct {
 	XLen   int  // Log length
 }
 
+type InstallSnapshotArgs struct {
+	Term              int    // leader's term
+	LeaderId          int    // So follower can redirect clients
+	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  int    // term of lastIncludedIndex
+	Offset            int    // byte offset where chunk is positioned in the snapshot file
+	Data              []byte // raw bytes of the snapshot chunk, starting at offset
+	Done              bool   // true if this is the last chunk
+}
+
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
@@ -231,8 +326,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.CurrentTerm {
 		logger.Debug(
 			logger.LT_Vote,
-			"%%%d term(%d) is more update compare to candidate %%%d's term(%d)\n",
-			rf.me, rf.CurrentTerm, args.CandidateID, args.Term,
+			"%%%d received stale RequestVote RPC from candidate %%%d(stale term: %d) on term %d\n",
+			rf.me, args.CandidateID, args.Term, rf.CurrentTerm,
 		)
 		return
 	} else if args.Term > rf.CurrentTerm {
@@ -254,7 +349,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 1. A has higger term in last entry,
 	// or
 	// 2. they have the same term, but A's log is longer the B
-	lastLogTerm := rf.Log[len(rf.Log)-1].Term
+	lastLogTerm := rf.snapshotTerm
+	if len(rf.Log) != 0 {
+		lastLogTerm = rf.logAtIndex(rf.logLength() - 1).Term
+	}
 	if args.LastLogTerm > lastLogTerm {
 		// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 		rf.VotedFor = args.CandidateID
@@ -264,14 +362,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			logger.LT_Vote, "%%%d vote candidate %%%d on term %d\n",
 			rf.me, args.CandidateID, rf.CurrentTerm,
 		)
-	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex+1 >= len(rf.Log) {
-		// if rf.eState == LEADER {
-		// 	logger.Debug(
-		// 		logger.LT_Vote, "%%%d refused to vote for candidate %%%d(it has already been leader) on term %d\n",
-		// 		rf.me, args.CandidateID, rf.currentTerm,
-		// 	)
-		// 	return
-		// }
+	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex+1 >= rf.logLength() {
 		reply.VoteGranted = true
 		rf.hasReceivedMsg = true
 		logger.Debug(logger.LT_Vote, "%%%d vote for candidate %%%d(Repeat Vote=%v) on term %d\n",
@@ -297,8 +388,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.CurrentTerm {
 		logger.Debug(
 			logger.LT_Client,
-			"%%%d's term(%d) is bigger than Leader %%%d's term(%d) in RPC AppendEntries\n",
-			rf.me, rf.CurrentTerm, args.LeaderId, args.Term,
+			"%%%d received stale AppendEntries RPC from leader %%%d (stale term: %d) on term %d\n",
+			rf.me, args.LeaderId, args.Term, rf.CurrentTerm,
 		)
 		return
 	} else if args.Term > rf.CurrentTerm {
@@ -322,47 +413,74 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.hasReceivedMsg = true
 	rf.VotedFor = args.LeaderId
 
-	// Check for log consistency between leader and follower
-	if len(rf.Log) <= args.PrevLogIndex {
-		reply.XLen = len(rf.Log)
+	// Rule 2: First we need to check whether follower has an entry at PreLogIndex
+	if rf.logLength() <= args.PrevLogIndex {
+		reply.XLen = rf.logLength()
 		logger.Debug(
 			logger.LT_Client,
 			"%%%d only has %d entries. PrevLogIndex %d is too long\n",
-			rf.me, len(rf.Log), args.PrevLogIndex,
+			rf.me, rf.logLength(), args.PrevLogIndex,
 		)
 		return
 	}
-	if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.XTerm = rf.Log[args.PrevLogIndex].Term
+	// Rule 2: Check for log consistency between leader and follower
+	if args.PrevLogIndex < rf.snapshotIndex {
+		// 发现了stale AppendEntries RPC
+		// 因为Snapshot()是client调用的，所以只有log entry被apply之后，
+		// Snapshot()才会被调用，所以 snapshotIndex <= lastAppiled <= commitIndex
+		// 所以snapshot中的条目肯定不会和leader的条目产生冲突
+		// 什么都不做，之后检查args.Entries[]的条目是否一致就好
+	} else if args.PrevLogIndex == rf.snapshotIndex {
+		if rf.snapshotTerm != args.PrevLogTerm {
+			// 不可能会不一样吧？
+			logger.Error(
+				logger.LT_Client,
+				"%%%d inconsistency between snapshotTerm %d and PrevLogTerm %d on term %d\n",
+				rf.me, rf.snapshotTerm, args.PrevLogTerm, rf.CurrentTerm,
+			)
+		}
+	} else if rf.logAtIndex(args.PrevLogIndex).Term != args.PrevLogTerm {
+		// 如果发生冲突，将冲突条目的term记录为XTerm，并寻找索引xIndex，
+		// xIndex是日志中，第一个term为XTerm的条目
 		xIndex := args.PrevLogIndex
-		for ; xIndex > 0; xIndex-- {
-			if rf.Log[xIndex-1].Term != reply.XTerm {
+		reply.XTerm = rf.logAtIndex(xIndex).Term
+		// 因为snapshot中的元素肯定不会有冲突，所以只需要检查snapshotIndex+1到xindex-1的条目即可
+		for ; xIndex-1 > rf.snapshotIndex; xIndex-- {
+			if rf.logAtIndex(xIndex-1).Term != reply.XTerm {
 				break
 			}
 		}
 		reply.XIndex = xIndex
-		reply.XLen = len(rf.Log)
+		reply.XLen = rf.logLength()
 		logger.Debug(
 			logger.LT_Client,
-			"%%%d has entry[%d] conflits with leader %%%d's [%d] at index %d on term %d\n",
-			rf.me, rf.Log[args.PrevLogIndex].Term,
+			"%%%d has entry[%d] conflicts with leader %%%d's [%d] at index %d on term %d\n",
+			rf.me, rf.logAtIndex(args.PrevLogIndex).Term,
 			args.LeaderId, args.PrevLogTerm, args.PrevLogIndex, rf.CurrentTerm,
 		)
 		return
 	}
 
 	if args.Entries == nil || len(args.Entries) == 0 {
-		logger.Debug(logger.LT_Client, "%%%d received heartbeart from leader %%%d on term %d\n",
-			rf.me, args.LeaderId, rf.CurrentTerm)
+		logger.Debug(
+			logger.LT_Client,
+			"%%%d received heartbeart(prev log index: %d) from leader %%%d on term %d\n",
+			rf.me, args.PrevLogIndex, args.LeaderId, rf.CurrentTerm,
+		)
 	}
 
 	// Append any new entries not already in the log
-	for offset := 0; offset < len(args.Entries); offset++ {
+	offset := 0
+	if args.PrevLogIndex < rf.snapshotIndex {
+		offset = rf.snapshotIndex - args.PrevLogIndex
+	}
+	for ; offset < len(args.Entries); offset++ {
 		entryIndex := args.PrevLogIndex + offset + 1
-		if len(rf.Log) <= entryIndex || rf.Log[entryIndex].Term != args.Entries[offset].Term {
+		if entryIndex >= rf.logLength() ||
+			rf.logAtIndex(entryIndex).Term != args.Entries[offset].Term {
 			// If an existing entry conflicts with a new one (same index but different terms),
 			// delete the existing entry and all that follow it
-			rf.Log = rf.Log[:entryIndex]
+			rf.Log = rf.logSlice(0, entryIndex)
 			// Append any new entries not already in the log
 			// logger.Warn(logger.LT_Log, "%d log len %d\n", rf.me, len(rf.log))
 			rf.Log = append(rf.Log, args.Entries[offset:]...)
@@ -370,7 +488,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			logger.Info(
 				logger.LT_Client,
 				"%%%d successfully append entry %v to itself, now has %d entries, on term %d\n",
-				rf.me, args.Entries[offset:], len(rf.Log), rf.CurrentTerm,
+				rf.me, args.Entries[offset:], rf.logLength(), rf.CurrentTerm,
 			)
 			break
 		}
@@ -387,6 +505,103 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		)
 		rf.cond.Broadcast()
 	}
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Set default reply
+	reply.Term = rf.CurrentTerm
+
+	// Rule 1: Reply immediately if term < currentTerm
+	if args.Term < rf.CurrentTerm {
+		logger.Debug(
+			logger.LT_Snap,
+			"%%%d received stale InstallSnapshot RPC(stale term: %d) on term %d\n",
+			rf.me, args.Term, rf.CurrentTerm,
+		)
+		return
+	} else if args.Term > rf.CurrentTerm {
+		rf.CurrentTerm = args.Term
+		rf.eState = FOLLOWER
+		logger.Debug(
+			logger.LT_Snap, "%%%d update its term to %d\n", rf.me, rf.CurrentTerm,
+		)
+		rf.VotedFor = args.LeaderId
+	}
+
+	rf.hasReceivedMsg = true
+	rf.VotedFor = args.LeaderId
+
+	if args.Offset != 0 || args.Done != true {
+		logger.Error(
+			logger.LT_Snap,
+			"%d: chunk is not implemented yet. Entire snapshot is sent in a single InstallSnapshot RPC\n",
+			rf.me,
+		)
+		return
+	}
+
+	if args.LastIncludedIndex <= rf.snapshotIndex {
+		logger.Trace(
+			logger.LT_Snap,
+			"%%%d received stale InstallSnapshot RPC(snapshot index: %d < %d) on term %d\n",
+			rf.me, args.LastIncludedIndex, rf.snapshotIndex, rf.CurrentTerm,
+		)
+		return
+	} else if rf.logLength()-1 < args.LastIncludedIndex {
+		originalIndex := rf.snapshotIndex
+		rf.snapshotIndex = args.LastIncludedIndex
+		rf.snapshotTerm = args.LastIncludedTerm
+		rf.snapshot = args.Data
+		rf.Log = make([]logEntry, 0)
+		logger.Trace(
+			logger.LT_Snap,
+			"%%%d updated its snapshot from index %d to %d on term %d\n",
+			rf.me, originalIndex, args.LastIncludedIndex, rf.CurrentTerm,
+		)
+	} else {
+		// 因为 rf.snapshotIndex < args.LastIncludedIndex < rf.logLength()
+		// 所以rf.logAtIndex(args.LastIncludedIndex)不会越界
+		if rf.logAtIndex(args.LastIncludedIndex).Term != args.Term {
+			originalLogLength := rf.logLength()
+			originalSnapshotIndex := rf.snapshotIndex
+			rf.snapshotIndex = args.LastIncludedIndex
+			rf.snapshotTerm = args.LastIncludedTerm
+			rf.snapshot = args.Data
+			rf.Log = make([]logEntry, 0)
+			logger.Info(
+				logger.LT_Snap,
+				"%%%d discarded entrie log(length %d) and created snapshot(index %d -> %d) on term %d\n",
+				rf.me, originalLogLength, originalSnapshotIndex, args.LastIncludedIndex, rf.CurrentTerm,
+			)
+		} else {
+			// Rule 6: If existing log entry has same index and term as snapshot’s
+			//         last included entry, retain log entries following it and reply
+			logger.Info(
+				logger.LT_Snap,
+				"%%%d: existing log entry has same index %d and term %d as snapshot’s last included entry\n",
+				rf.me, args.LastIncludedIndex, args.LastIncludedTerm,
+			)
+			return
+		}
+	}
+	rf.lastAppiled = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.snapshot,
+		SnapshotTerm:  rf.snapshotTerm,
+		SnapshotIndex: rf.snapshotIndex,
+	}
+	rf.mu.Unlock()
+	rf.applyCh <- msg
+	rf.mu.Lock()
+	logger.Info(
+		logger.LT_APPLIER, "%%%d applied <Snapshot Index %d, Snapshot Term %d> on term %d\n",
+		rf.me, msg.SnapshotIndex, msg.SnapshotTerm, rf.CurrentTerm,
+	)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -423,11 +638,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(
-	server int,
-	args *AppendEntriesArgs,
-	reply *AppendEntriesReply,
+	server int, args *AppendEntriesArgs, reply *AppendEntriesReply,
 ) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(
+	server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply,
+) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 
 	return ok
 }
@@ -443,12 +664,20 @@ func (rf *Raft) sendHeartBeat(client int) {
 		logger.LT_Leader, "%%%d attempt to send heartbeat to %%%d on term %d\n",
 		rf.me, client, sentTerm,
 	)
-	preLogIndex := rf.nextIndex[client] - 1
+	// TODO 稍微有点问题，如果follower的日志有残缺，那么snapshotIndex会作为prevLogIndex的下限
+	// 但是随之而来的问题是，folloer在处理appendentries是，会发生冲突然后直接返回，
+	// 不会打印接收到心跳的日志信息，到时候得改一改
+	prevLogIndex := rf.snapshotIndex
+	prevLogTerm := rf.snapshotTerm
+	if rf.nextIndex[client]-1 > rf.snapshotIndex {
+		prevLogIndex = rf.nextIndex[client] - 1
+		prevLogTerm = rf.logAtIndex(prevLogIndex).Term
+	}
 	args := AppendEntriesArgs{
 		Term:         sentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: preLogIndex,
-		PrevLogTerm:  rf.Log[preLogIndex].Term,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
 		LeaderCommit: rf.commitIndex,
 	}
 	rf.mu.Unlock()
@@ -508,10 +737,7 @@ func (rf *Raft) heartBeatSender() {
 
 // 要传一下term 和 len(rf.log) ?
 func (rf *Raft) replicate(
-	client int,
-	replicateTerm int,
-	lastLogIndex int,
-	finishedClient chan int,
+	client int, replicateTerm int, lastLogIndex int, finishedClient chan int,
 ) {
 	rf.mu.Lock()
 	if rf.nextIndex[client] > lastLogIndex {
@@ -525,16 +751,38 @@ func (rf *Raft) replicate(
 	}
 
 	for {
-		prevLogIndex := rf.nextIndex[client] - 1
+		var prevLogIndex int
+		var prevLogTerm int
+		if rf.nextIndex[client]-1 > rf.snapshotIndex {
+			prevLogIndex = rf.nextIndex[client] - 1
+			prevLogTerm = rf.logAtIndex(prevLogIndex).Term
+		} else if rf.nextIndex[client]-1 == rf.snapshotIndex {
+			prevLogIndex = rf.snapshotIndex
+			prevLogTerm = rf.snapshotTerm
+		} else {
+			// TODO 发送installsnapshot
+			rf.mu.Unlock()
+			if rf.fillGap(client, replicateTerm) == false {
+				logger.Trace(
+					logger.LT_Leader, "%%%d stop replicating to %%%d since InstallSnapshot failute\n",
+					rf.me, client,
+				)
+				return
+			}
+			rf.mu.Lock()
+			prevLogIndex = rf.snapshotIndex
+			prevLogTerm = rf.snapshotTerm
+		}
+
 		// 如果不采用深拷贝，可能会产生data race
 		// RPC调用时读取args的Entries没有锁，这时候如果其他goroutine在写的话，会产生data race
-		entries := make([]logEntry, len(rf.Log)-prevLogIndex-1)
-		copy(entries, rf.Log[prevLogIndex+1:])
+		entries := make([]logEntry, rf.logLength()-prevLogIndex-1)
+		copy(entries, rf.logSlice(prevLogIndex+1, -1))
 		args := AppendEntriesArgs{
 			Term:         replicateTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  rf.Log[prevLogIndex].Term,
+			PrevLogTerm:  prevLogTerm,
 			Entries:      entries,
 		}
 		reply := AppendEntriesReply{}
@@ -550,10 +798,7 @@ func (rf *Raft) replicate(
 			logger.Trace(
 				logger.LT_Leader,
 				"%%%d stop sendAppendEntries(killed: %v, leader: %v) on term %d\n",
-				rf.me,
-				rf.killed(),
-				rf.eState == LEADER,
-				rf.CurrentTerm,
+				rf.me, rf.killed(), rf.eState == LEADER, rf.CurrentTerm,
 			)
 			rf.mu.Unlock()
 			return
@@ -570,7 +815,7 @@ func (rf *Raft) replicate(
 				// 之后再执行A，这时候我们保持matchIndex和nextIndex不变就好
 				rf.matchIndex[client] = max(rf.matchIndex[client], prevLogIndex+len(args.Entries))
 				rf.nextIndex[client] = rf.matchIndex[client] + 1
-				logger.Trace(
+				logger.Info(
 					logger.LT_Leader,
 					"%%%d succeeded in replicating entry %v to %%%d(sent on term %d) on term %d\n",
 					rf.me, args.Entries, client, replicateTerm, rf.CurrentTerm,
@@ -643,6 +888,72 @@ func (rf *Raft) replicate(
 	finishedClient <- client
 }
 
+func (rf *Raft) fillGap(client int, replicateTerm int) bool {
+	rf.mu.Lock()
+	args := InstallSnapshotArgs{
+		Term:              replicateTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.snapshotIndex,
+		LastIncludedTerm:  rf.snapshotTerm,
+		Offset:            0,
+		Data:              rf.snapshot,
+		Done:              true,
+	}
+	reply := InstallSnapshotReply{}
+	rf.mu.Unlock()
+
+	for {
+		rf.mu.Lock()
+		if rf.killed() || rf.eState != LEADER {
+			logger.Trace(
+				logger.LT_Snap,
+				"%%%d stop sendInstallSnapshot(killed: %v, leader: %v) on term %d\n",
+				rf.me, rf.killed(), rf.eState == LEADER, rf.CurrentTerm,
+			)
+			rf.mu.Unlock()
+			return false
+		}
+		logger.Trace(
+			logger.LT_Leader,
+			"%%%d attempt to InstallSnapshot(Index %d, Term %d) to %%%d on term %d\n",
+			rf.me, args.LastIncludedIndex, args.LastIncludedTerm, client, rf.CurrentTerm,
+		)
+		rf.mu.Unlock()
+
+		if rf.sendInstallSnapshot(client, &args, &reply) == true {
+			rf.mu.Lock()
+			if rf.CurrentTerm < reply.Term {
+				rf.CurrentTerm = reply.Term
+				rf.eState = FOLLOWER
+				logger.Trace(
+					logger.LT_Snap,
+					"%%%d update its term to %d and convert to follower\n",
+					rf.me, rf.CurrentTerm,
+				)
+				rf.persist()
+				rf.mu.Unlock()
+				return false
+			} else if rf.CurrentTerm > replicateTerm { // Simply drop the RPC response from the old term
+				logger.Trace(
+					logger.LT_Leader,
+					"%%%d drop an stale sendInstallSnapshot response(sent on term %d) on current term %d\n",
+					rf.me, replicateTerm, rf.CurrentTerm,
+				)
+				rf.mu.Unlock()
+				return false
+			} else {
+				logger.Info(
+					logger.LT_Snap,
+					"%%%d succeeded in InstallSnapshot(Index %d, Term %d) to %%%d on term %d\n",
+					rf.me, args.LastIncludedIndex, args.LastIncludedTerm, client, rf.CurrentTerm,
+				)
+				rf.mu.Unlock()
+				return true
+			}
+		}
+	}
+}
+
 // return false if there is no need to start an election
 // else start an election and return true
 func (rf *Raft) startElection() bool {
@@ -663,8 +974,13 @@ func (rf *Raft) startElection() bool {
 	rf.CurrentTerm++
 	rf.eState = CANDIDATE
 	electionTerm := rf.CurrentTerm
-	lastLogIndex := len(rf.Log) - 1
-	lastLogTerm := rf.Log[lastLogIndex].Term
+
+	lastLogIndex := rf.snapshotIndex
+	lastLogTerm := rf.snapshotTerm
+	if len(rf.Log) != 0 {
+		lastLogIndex = rf.logLength() - 1
+		lastLogTerm = rf.logAtIndex(lastLogIndex).Term
+	}
 	logger.Info(
 		logger.LT_Vote, "%%%d starts an election on term %d\n", rf.me, electionTerm,
 	)
@@ -745,7 +1061,7 @@ func (rf *Raft) startElection() bool {
 				}
 				rf.eState = LEADER
 				for j := range rf.peers {
-					rf.nextIndex[j] = len(rf.Log)
+					rf.nextIndex[j] = rf.logLength()
 					rf.matchIndex[j] = 0
 				}
 				logger.Info(
@@ -761,10 +1077,6 @@ func (rf *Raft) startElection() bool {
 }
 
 func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
-	// if _, isLeader := rf.GetState(); isLeader == false { // Just in case
-	// 	logger.Fatalln(logger.LT_Leader, "Only leader has right to execute command")
-	// }
-
 	// Replicate
 	finishedClient := make(chan int)
 	for i := range rf.peers {
@@ -794,7 +1106,7 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 	// commitIndex+1  commitIndex+2 ... len(rf.log)-1
 	// 0              1             ... len(count)-1
 	var i int
-	countLength := len(rf.Log) - 1 - rf.commitIndex
+	countLength := rf.logLength() - 1 - rf.commitIndex
 	if countLength == 0 {
 		logger.Trace(
 			logger.LT_Commit, "%%%d: stale command committed on term %d\n",
@@ -803,10 +1115,11 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 		return
 	}
 	count := make([]int, countLength)
+	for j := 0; j < len(count); j++ {
+		count[j] = 1
+	}
 	for i = range rf.peers {
-		if i == rf.me {
-			count[len(count)-1]++
-		} else {
+		if i != rf.me {
 			index := rf.matchIndex[i] - rf.commitIndex - 1
 			if index >= 0 {
 				count[index]++
@@ -815,7 +1128,7 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 	}
 	logger.Trace(logger.LT_Commit, "%%%d replic count: %v\n", rf.me, count)
 	for i = countLength - 1; i >= 0; i-- {
-		if count[i] >= majority && rf.Log[rf.commitIndex+1+i].Term == rf.CurrentTerm {
+		if count[i] >= majority && rf.logAtIndex(rf.commitIndex+1+i).Term == rf.CurrentTerm {
 			newCommitIndex := rf.commitIndex + 1 + i
 			logger.Debug(
 				logger.LT_Leader, "%%%d update commitIndex(from %d to %d) on term %d\n",
@@ -835,21 +1148,24 @@ func (rf *Raft) applier() {
 			break
 		} else if rf.lastAppiled < rf.commitIndex {
 			for {
-				if rf.lastAppiled >= len(rf.Log) {
+				if rf.lastAppiled >= rf.logLength() {
 					logger.Error(
 						logger.LT_APPLIER, "%%%d: index(lastAppiled %d) out of range(log length %d)\n",
-						rf.me, rf.lastAppiled, len(rf.Log),
+						rf.me, rf.lastAppiled, rf.logLength(),
 					)
 				}
 				rf.lastAppiled++
 				msg := ApplyMsg{
 					CommandValid: true,
-					Command:      rf.Log[rf.lastAppiled].Command,
+					Command:      rf.logAtIndex(rf.lastAppiled).Command,
 					CommandIndex: rf.lastAppiled,
 				}
+				rf.mu.Unlock()
 				rf.applyCh <- msg
+				rf.mu.Lock()
 				logger.Info(
-					logger.LT_APPLIER, "%%%d applyMsg %v on term %d\n", rf.me, msg, rf.CurrentTerm,
+					logger.LT_APPLIER, "%%%d applied <Command: %d, Command Index %d> on term %d\n",
+					rf.me, msg.Command, msg.CommandIndex, rf.CurrentTerm,
 				)
 				if rf.lastAppiled == rf.commitIndex {
 					break
@@ -897,7 +1213,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.Log = append(rf.Log, logEntry{Term: rf.CurrentTerm, Command: command})
 			rf.persist()
 			replicateTerm := rf.CurrentTerm
-			lastLogIndex := len(rf.Log) - 1
+			lastLogIndex := rf.logLength() - 1
 			index = lastLogIndex
 			go rf.commit(replicateTerm, lastLogIndex)
 		}
@@ -980,7 +1296,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// RPC to contain 0 as PrevLogIndex, and be a valid index into the log.
 	rf.Log = make([]logEntry, 0)
 	rf.Log = append(rf.Log, logEntry{Term: 0})
-	rf.index = 1
 
 	rf.cond = *sync.NewCond(&rf.mu)
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -989,14 +1304,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	if rf.snapshot == nil || len(rf.snapshot) == 0 {
+		rf.snapshot = nil
+		rf.snapshotIndex = -1
+		rf.snapshotTerm = -1
+	}
 
 	logger.Info(logger.LT_Log, "%%%d had been made\n", rf.me)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
-	rf.commitIndex = 0
-	rf.lastAppiled = 0
+	rf.commitIndex = max(0, rf.snapshotIndex)
+	rf.lastAppiled = max(0, rf.snapshotIndex)
 	go rf.applier()
 
 	return rf
