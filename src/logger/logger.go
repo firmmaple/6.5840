@@ -24,6 +24,7 @@ const (
 var ll_desc = []string{"ALL", "TRACE", "DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"}
 
 var defaultLogger = NewLogger(LL_TRACE, os.Stdout, "")
+
 // var defaultLogger = NewLogger(LL_DEBUG, os.Stdout, "")
 // var defaultLogger = NewLogger(LL_INFO, os.Stdout, "")
 // var defaultLogger = NewLogger(LL_WARN, os.Stdout, "")
@@ -113,6 +114,31 @@ func (l *Logger) Error(topic LogTopic, format string, args ...interface{}) {
 func (l *Logger) Fatal(topic LogTopic, format string, args ...interface{}) {
 	defer os.Exit(1)
 	l.log(LL_FATAL, topic, format, args...)
+}
+
+func (l *Logger) Traceln(topic LogTopic, message interface{}) {
+	l.SimpleLog(LL_TRACE, topic, message)
+}
+
+func (l *Logger) Debugln(topic LogTopic, message interface{}) {
+	l.SimpleLog(LL_DEBUG, topic, message)
+}
+
+func (l *Logger) Infoln(topic LogTopic, message interface{}) {
+	l.SimpleLog(LL_INFO, topic, message)
+}
+
+func (l *Logger) Warnln(topic LogTopic, message interface{}) {
+	l.SimpleLog(LL_WARN, topic, message)
+}
+
+func (l *Logger) Errorln(topic LogTopic, message interface{}) {
+	l.SimpleLog(LL_ERROR, topic, message)
+}
+
+func (l *Logger) Fatalln(topic LogTopic, message interface{}) {
+	l.SimpleLog(LL_FATAL, topic, message)
+	os.Exit(1)
 }
 
 func Trace(topic LogTopic, format string, args ...interface{}) {

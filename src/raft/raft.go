@@ -20,6 +20,7 @@ package raft
 import (
 	"bytes"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,9 @@ const (
 )
 
 const MS_HEARTBEAT_INTERVAL = 100
+
+var raftLog = logger.NewLogger(logger.LL_TRACE, os.Stdout, "RAFT")
+// var raftLog = logger.NewLogger(logger.LL_WARN, os.Stdout, "RAFT")
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -133,7 +137,7 @@ func (rf *Raft) logLength() int {
 // 调用者必须确保index大于快照中包含的最后一个条目的索引，即 index > snapshotIndex
 func (rf *Raft) logAtIndex(index int) logEntry {
 	if index-rf.snapshotLength() < 0 || index-rf.snapshotLength() >= len(rf.Log) {
-		logger.Warn(
+		raftLog.Warn(
 			logger.LT_Log,
 			"%%%d: log index out of range - index: %d, snapshot length: %d\n",
 			rf.me, index, rf.snapshotLength(),
@@ -191,28 +195,28 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	if e.Encode(rf.CurrentTerm) != nil || e.Encode(rf.VotedFor) != nil || e.Encode(rf.Log) != nil ||
 		e.Encode(rf.snapshotIndex) != nil || e.Encode(rf.snapshotTerm) != nil {
-		logger.Errorln(logger.LT_Persist, "Failed to encode some fields")
+		raftLog.Errorln(logger.LT_Persist, "Failed to encode some fields")
 	}
 
 	if e.Encode(rf.CurrentTerm) != nil {
-		logger.Error(logger.LT_Persist, "%%%d: Encode CurrentTerm: %d", rf.me, rf.CurrentTerm)
+		raftLog.Error(logger.LT_Persist, "%%%d: Encode CurrentTerm: %d", rf.me, rf.CurrentTerm)
 	}
 	if e.Encode(rf.VotedFor) != nil {
-		logger.Error(logger.LT_Persist, "%%%d: Failed to encode VotedFor: %d", rf.me, rf.VotedFor)
+		raftLog.Error(logger.LT_Persist, "%%%d: Failed to encode VotedFor: %d", rf.me, rf.VotedFor)
 	}
 	if e.Encode(rf.Log) != nil {
-		logger.Error(logger.LT_Persist, "%%%d: Failed to encode Log", rf.me)
+		raftLog.Error(logger.LT_Persist, "%%%d: Failed to encode Log", rf.me)
 	}
 	if e.Encode(rf.snapshotIndex) != nil {
-		logger.Error(logger.LT_Persist, "%%%d: Encode snapshotIndex: %d", rf.me, rf.snapshotIndex)
+		raftLog.Error(logger.LT_Persist, "%%%d: Encode snapshotIndex: %d", rf.me, rf.snapshotIndex)
 	}
 	if e.Encode(rf.snapshotTerm) != nil {
-		logger.Error(logger.LT_Persist, "%%%d: Encode snapshotTerm: %d", rf.me, rf.snapshotTerm)
+		raftLog.Error(logger.LT_Persist, "%%%d: Encode snapshotTerm: %d", rf.me, rf.snapshotTerm)
 	}
 
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, rf.snapshot)
-	logger.Trace(
+	raftLog.Trace(
 		logger.LT_Persist,
 		"%%%d persisted Raft state: Term %d, VotedFor %d, LogLen %d, Snapshot(Index %d, Term %d)\n",
 		rf.me, rf.CurrentTerm, rf.VotedFor, rf.logLength(), rf.snapshotIndex, rf.snapshotTerm,
@@ -224,30 +228,30 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		rf.snapshotIndex = -1
 		rf.snapshotTerm = -1
-		logger.Trace(logger.LT_Persist, "%%%d bootstrap without any state\n", rf.me)
+		raftLog.Trace(logger.LT_Persist, "%%%d bootstrap without any state\n", rf.me)
 		return
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
 	if err := d.Decode(&rf.CurrentTerm); err != nil {
-		logger.Error(logger.LT_Persist, "%%%d: error decoding currentTerm: %v\n", rf.me, err)
+		raftLog.Error(logger.LT_Persist, "%%%d: error decoding currentTerm: %v\n", rf.me, err)
 	}
 	if err := d.Decode(&rf.VotedFor); err != nil {
-		logger.Error(logger.LT_Persist, "%%%d: error decoding votedFor: %v\n", rf.me, err)
+		raftLog.Error(logger.LT_Persist, "%%%d: error decoding votedFor: %v\n", rf.me, err)
 	}
 	if err := d.Decode(&rf.Log); err != nil {
-		logger.Error(logger.LT_Persist, "%%%d: error decoding log: %v\n", rf.me, err)
+		raftLog.Error(logger.LT_Persist, "%%%d: error decoding log: %v\n", rf.me, err)
 	}
 	if err := d.Decode(&rf.snapshotIndex); err != nil {
-		logger.Error(logger.LT_Persist, "%%%d: error decoding snapshotIndex: %v\n", rf.me, err)
+		raftLog.Error(logger.LT_Persist, "%%%d: error decoding snapshotIndex: %v\n", rf.me, err)
 	}
 	if err := d.Decode(&rf.snapshotTerm); err != nil {
-		logger.Error(logger.LT_Persist, "%%%d: error decoding snapshotTerm: %v\n", rf.me, err)
+		raftLog.Error(logger.LT_Persist, "%%%d: error decoding snapshotTerm: %v\n", rf.me, err)
 	}
 
 	rf.snapshot = rf.persister.ReadSnapshot()
-	logger.Trace(
+	raftLog.Trace(
 		logger.LT_Persist,
 		"%%%d read Raft state: Term %d, VotedFor %d, LogLen %d, Snapshot(Index %d, Term %d)\n",
 		rf.me, rf.CurrentTerm, rf.VotedFor, rf.logLength(), rf.snapshotIndex, rf.snapshotTerm,
@@ -263,7 +267,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	logger.Debug(
+	raftLog.Debug(
 		logger.LT_Snap,
 		"%%%d attempt to create a snapshot up to index %d(last log index %d) on term %d\n",
 		rf.me, index, rf.logLength()-1, rf.CurrentTerm,
@@ -335,7 +339,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.CurrentTerm
 
 	if args.Term < rf.CurrentTerm {
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Vote,
 			"%%%d received stale RequestVote RPC from candidate %%%d(stale term: %d) on term %d\n",
 			rf.me, args.CandidateID, args.Term, rf.CurrentTerm,
@@ -345,12 +349,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.eState = FOLLOWER
 		rf.VotedFor = -1
 		rf.CurrentTerm = args.Term
-		logger.Debug(logger.LT_Vote, "%%%d converted to follower on term %d\n", rf.me, rf.CurrentTerm)
+		raftLog.Debug(logger.LT_Vote, "%%%d converted to follower on term %d\n", rf.me, rf.CurrentTerm)
 	}
 
 	// 判断server是否在当前term，已将把选票投给其他candidate
 	if rf.VotedFor != -1 && rf.VotedFor != args.CandidateID {
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Vote,
 			"%%%d refused to vote for candidate %%%d(it has already voted for %%%d) on term %d\n",
 			rf.me, args.CandidateID, rf.VotedFor, rf.CurrentTerm,
@@ -372,7 +376,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.VotedFor = args.CandidateID
 		reply.VoteGranted = true
 		rf.hasReceivedMsg = true
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Vote, "%%%d votes for candidate %%%d on term %d\n",
 			rf.me, args.CandidateID, rf.CurrentTerm,
 		)
@@ -380,14 +384,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 候选人的日志任期号相同且日志长度不短于本服务器，授予投票
 		reply.VoteGranted = true
 		rf.hasReceivedMsg = true
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Vote, "%%%d votes for candidate %%%d(has voted in currently term: %v) on term %d\n",
 			rf.me, args.CandidateID, rf.VotedFor == args.CandidateID, rf.CurrentTerm,
 		)
 		rf.VotedFor = args.CandidateID
 	} else {
 		// 候选人的日志不如本服务器的日志新，拒绝投票
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Vote, "%%%d refused to vote for candidate %%%d since it is more update-to-date on term %d\n",
 			rf.me, args.CandidateID, rf.CurrentTerm,
 		)
@@ -406,7 +410,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Sucess = false
 
 	if args.Term < rf.CurrentTerm {
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Client,
 			"%%%d received stale AppendEntries RPC from leader %%%d (stale term: %d) on term %d\n",
 			rf.me, args.LeaderId, args.Term, rf.CurrentTerm,
@@ -415,7 +419,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
 		rf.eState = FOLLOWER
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Client, "%%%d updated its term to %d\n", rf.me, rf.CurrentTerm,
 		)
 		rf.VotedFor = args.LeaderId
@@ -423,7 +427,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// If AppendEntries RPC received from new leader: convert to follower
 		rf.eState = FOLLOWER
 		rf.VotedFor = args.LeaderId
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Candidate,
 			"%%%d abstained from election on term %d\n",
 			rf.me, rf.CurrentTerm,
@@ -438,7 +442,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 首先检查Server存在与PrevLogIndex对应的日志条目
 	if rf.logLength() <= args.PrevLogIndex {
 		reply.XLen = rf.logLength()
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Client,
 			"%%%d only has %d entries. PrevLogIndex %d is too long\n",
 			rf.me, rf.logLength(), args.PrevLogIndex,
@@ -456,7 +460,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if args.PrevLogIndex == rf.snapshotIndex {
 		if rf.snapshotTerm != args.PrevLogTerm {
 			// 不可能会不一样吧？
-			logger.Error(
+			raftLog.Error(
 				logger.LT_Client,
 				"%%%d inconsistency between snapshotTerm %d and PrevLogTerm %d on term %d\n",
 				rf.me, rf.snapshotTerm, args.PrevLogTerm, rf.CurrentTerm,
@@ -478,7 +482,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.XIndex = xIndex
 		reply.XLen = rf.logLength()
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Client,
 			"%%%d has entry[%d] conflicts with leader %%%d's [%d] at index %d on term %d\n",
 			rf.me, rf.logAtIndex(args.PrevLogIndex).Term,
@@ -488,7 +492,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.Entries == nil || len(args.Entries) == 0 {
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Client,
 			"%%%d received heartbeart(prev log index: %d) from leader %%%d on term %d\n",
 			rf.me, args.PrevLogIndex, args.LeaderId, rf.CurrentTerm,
@@ -510,7 +514,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.Log = rf.logSlice(0, entryIndex)
 			// Append any new entries not already in the log
 			rf.Log = append(rf.Log, args.Entries[offset:]...)
-			logger.Info(
+			raftLog.Info(
 				logger.LT_Client,
 				"%%%d successfully append entry %v to itself, now has %d entries, on term %d\n",
 				rf.me, args.Entries[offset:], rf.logLength(), rf.CurrentTerm,
@@ -523,7 +527,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		originCommitIndex := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Client,
 			"%%%d follows its leader %%%d's commitIndex changing it from %d to %d on term %d\n",
 			rf.me, args.LeaderId, originCommitIndex, rf.commitIndex, rf.CurrentTerm,
@@ -541,7 +545,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// Rule 1: Reply immediately if term < currentTerm
 	if args.Term < rf.CurrentTerm {
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Snap,
 			"%%%d received stale InstallSnapshot RPC(stale term: %d) on term %d\n",
 			rf.me, args.Term, rf.CurrentTerm,
@@ -550,7 +554,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	} else if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
 		rf.eState = FOLLOWER
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Snap, "%%%d update its term to %d\n", rf.me, rf.CurrentTerm,
 		)
 		rf.VotedFor = args.LeaderId
@@ -560,7 +564,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.Offset != 0 || args.Done != true {
 		// The offset mechanism for splitting up the snapshot is not implemented.
-		logger.Error(
+		raftLog.Error(
 			logger.LT_Snap,
 			"%d: chunk is not implemented yet. Entire snapshot is sent in a single InstallSnapshot RPC\n",
 			rf.me,
@@ -570,7 +574,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.LastIncludedIndex <= rf.snapshotIndex {
 		// 如果收到的快照的索引不比当前快照新，则认为是过时的快照信息，直接返回
-		logger.Trace(
+		raftLog.Trace(
 			logger.LT_Snap,
 			"%%%d received stale InstallSnapshot RPC(snapshot index: %d < %d) on term %d\n",
 			rf.me, args.LastIncludedIndex, rf.snapshotIndex, rf.CurrentTerm,
@@ -584,7 +588,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.snapshotTerm = args.LastIncludedTerm
 		rf.snapshot = args.Data
 		rf.Log = make([]logEntry, 0)
-		logger.Trace(
+		raftLog.Trace(
 			logger.LT_Snap,
 			"%%%d updated its snapshot from index %d to %d on term %d\n",
 			rf.me, originalIndex, args.LastIncludedIndex, rf.CurrentTerm,
@@ -601,7 +605,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			rf.snapshotTerm = args.LastIncludedTerm
 			rf.snapshot = args.Data
 			rf.Log = make([]logEntry, 0)
-			logger.Info(
+			raftLog.Info(
 				logger.LT_Snap,
 				"%%%d discarded entrie log(length %d) and created snapshot(index %d -> %d) on term %d\n",
 				rf.me, originalLogLength, originalSnapshotIndex, args.LastIncludedIndex, rf.CurrentTerm,
@@ -609,7 +613,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		} else {
 			// Rule 6: If existing log entry has same index and term as snapshot’s
 			//         last included entry, retain log entries following it and reply
-			logger.Info(
+			raftLog.Info(
 				logger.LT_Snap,
 				"%%%d: existing log entry has same index %d and term %d as snapshot’s last included entry\n",
 				rf.me, args.LastIncludedIndex, args.LastIncludedTerm,
@@ -628,7 +632,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Unlock()
 	rf.applyCh <- msg
 	rf.mu.Lock()
-	logger.Info(
+	raftLog.Info(
 		logger.LT_APPLIER, "%%%d applied <Snapshot Index %d, Snapshot Term %d> on term %d\n",
 		rf.me, msg.SnapshotIndex, msg.SnapshotTerm, rf.CurrentTerm,
 	)
@@ -687,7 +691,7 @@ func (rf *Raft) sendInstallSnapshot(
 // 心跳的发送有助于保持领导者的权威并防止Follower超时转换为Candidate
 func (rf *Raft) sendHeartBeat(server int, sentTerm int) {
 	rf.mu.Lock()
-	logger.Trace(
+	raftLog.Trace(
 		logger.LT_Leader, "%%%d attempt to send heartbeat to %%%d on term %d\n",
 		rf.me, server, sentTerm,
 	)
@@ -714,14 +718,14 @@ func (rf *Raft) sendHeartBeat(server int, sentTerm int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if !ok {
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Leader,
 			"%%%d cannot send heartbeat(sent on term %d) to %d on term %d\n",
 			rf.me, sentTerm, server, rf.CurrentTerm,
 		)
 		return
 	}
-	logger.Debug(
+	raftLog.Debug(
 		logger.LT_Leader,
 		"%%%d sent heartbeat to server %%%d on term %d, received reply on term %d\n",
 		rf.me, server, sentTerm, rf.CurrentTerm,
@@ -729,7 +733,7 @@ func (rf *Raft) sendHeartBeat(server int, sentTerm int) {
 	if reply.Term > rf.CurrentTerm {
 		rf.eState = FOLLOWER
 		rf.CurrentTerm = reply.Term
-		logger.Debug(
+		raftLog.Debug(
 			logger.LT_Client, "%%%d update its term to %d and convert to follower\n",
 			rf.me, rf.CurrentTerm,
 		)
@@ -762,7 +766,7 @@ func (rf *Raft) replicate(
 ) {
 	rf.mu.Lock()
 	if rf.nextIndex[client] > lastLogIndex {
-		logger.Warn(
+		raftLog.Debug(
 			logger.LT_Leader,
 			"%%%d's lastLogIndex %d < client %%%d's nextIndex %d when replicate\n",
 			rf.me, lastLogIndex, client, rf.nextIndex[client],
@@ -784,7 +788,7 @@ func (rf *Raft) replicate(
 			// 如果follower落后于leader的snapshot，更新follower的快照
 			rf.mu.Unlock()
 			if rf.updateFollowerSnapshot(client, replicateTerm) == false {
-				logger.Trace(
+				raftLog.Trace(
 					logger.LT_Leader, "%%%d stop replicating to %%%d since InstallSnapshot failute\n",
 					rf.me, client,
 				)
@@ -807,7 +811,7 @@ func (rf *Raft) replicate(
 			Entries:      entries,
 		}
 		reply := AppendEntriesReply{}
-		logger.Trace(
+		raftLog.Trace(
 			logger.LT_Leader, "%%%d attempt to replicate entries %v to %%%d on term %d\n",
 			rf.me, args.Entries, client, replicateTerm,
 		)
@@ -816,7 +820,7 @@ func (rf *Raft) replicate(
 		ok := rf.sendAppendEntries(client, &args, &reply)
 		rf.mu.Lock()
 		if rf.killed() || rf.eState != LEADER {
-			logger.Trace(
+			raftLog.Trace(
 				logger.LT_Leader,
 				"%%%d stop sendAppendEntries(killed: %v, leader: %v) on term %d\n",
 				rf.me, rf.killed(), rf.eState == LEADER, rf.CurrentTerm,
@@ -835,7 +839,7 @@ func (rf *Raft) replicate(
 				// 之后再执行A，这时候我们保持matchIndex和nextIndex不变就好
 				rf.matchIndex[client] = max(rf.matchIndex[client], prevLogIndex+len(args.Entries))
 				rf.nextIndex[client] = rf.matchIndex[client] + 1
-				logger.Info(
+				raftLog.Info(
 					logger.LT_Leader,
 					"%%%d succeeded in replicating entry %v to %%%d(sent on term %d) on term %d\n",
 					rf.me, args.Entries, client, replicateTerm, rf.CurrentTerm,
@@ -845,7 +849,7 @@ func (rf *Raft) replicate(
 				if rf.CurrentTerm < reply.Term {
 					rf.CurrentTerm = reply.Term
 					rf.eState = FOLLOWER
-					logger.Debug(
+					raftLog.Debug(
 						logger.LT_Leader,
 						"%%%d update its term to %d and convert to follower\n",
 						rf.me, rf.CurrentTerm,
@@ -854,7 +858,7 @@ func (rf *Raft) replicate(
 					rf.mu.Unlock()
 					return
 				} else if rf.CurrentTerm > replicateTerm { // Simply drop the RPC response from the old term
-					logger.Trace(
+					raftLog.Trace(
 						logger.LT_Leader,
 						"%%%d drop an old appendEntries response(sent on term %d) on current term %d\n",
 						rf.me, replicateTerm, rf.CurrentTerm,
@@ -868,14 +872,14 @@ func (rf *Raft) replicate(
 					// Case 3: follower's log is too short:
 					//   nextIndex = XLen
 					rf.nextIndex[client] = reply.XLen
-					logger.Trace(
+					raftLog.Trace(
 						logger.LT_Leader, "%d fast backup case 3 - follower's log is too short, only %d\n",
 						rf.me, reply.XLen,
 					)
 				} else if lastEntryIndex := rf.hasTerm(reply.XTerm, args.PrevLogIndex); lastEntryIndex == -1 {
 					// Case 1: leader doesn't have XTerm:
 					//   nextIndex = XIndex
-					logger.Trace(
+					raftLog.Trace(
 						logger.LT_Leader,
 						"%d fast backup case 1 - leader doesn't have the term %d and next index will be %d\n",
 						rf.me, reply.XTerm, reply.XIndex,
@@ -884,20 +888,20 @@ func (rf *Raft) replicate(
 				} else {
 					// Case 2: leader has XTerm:
 					//   nextIndex = leader's last entry for XTerm
-					logger.Trace(
+					raftLog.Trace(
 						logger.LT_Leader, "%d fast backup case 2 - leadder has XTerm %d and its last index is %d\n",
 						rf.me, reply.XTerm, lastEntryIndex,
 					)
 					rf.nextIndex[client] = lastEntryIndex
 				}
-				logger.Debug(
+				raftLog.Debug(
 					logger.LT_Leader,
 					"%%%d: AppendEntries to %%%d failed(sent on term %d) beacause of inconsistency on term %d, retry again\n",
 					rf.me, client, replicateTerm, rf.CurrentTerm,
 				)
 			}
 		} else { // RPC failed
-			logger.Trace(
+			raftLog.Trace(
 				logger.LT_Leader,
 				"%%%d: AppendEntries(sent on term %d) to %%%d failed, try again\n",
 				rf.me, replicateTerm, client,
@@ -927,7 +931,7 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 	for {
 		rf.mu.Lock()
 		if rf.killed() || rf.eState != LEADER {
-			logger.Trace(
+			raftLog.Trace(
 				logger.LT_Snap,
 				"%%%d stop sendInstallSnapshot(killed: %v, leader: %v) on term %d\n",
 				rf.me, rf.killed(), rf.eState == LEADER, rf.CurrentTerm,
@@ -935,7 +939,7 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 			rf.mu.Unlock()
 			return false
 		}
-		logger.Trace(
+		raftLog.Trace(
 			logger.LT_Leader,
 			"%%%d attempt to InstallSnapshot(Index %d, Term %d) to %%%d on term %d\n",
 			rf.me, args.LastIncludedIndex, args.LastIncludedTerm, client, rf.CurrentTerm,
@@ -947,7 +951,7 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 			if rf.CurrentTerm < reply.Term {
 				rf.CurrentTerm = reply.Term
 				rf.eState = FOLLOWER
-				logger.Trace(
+				raftLog.Trace(
 					logger.LT_Snap,
 					"%%%d update its term to %d and convert to follower\n",
 					rf.me, rf.CurrentTerm,
@@ -956,7 +960,7 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 				rf.mu.Unlock()
 				return false
 			} else if rf.CurrentTerm > replicateTerm { // Simply drop the RPC response from the old term
-				logger.Trace(
+				raftLog.Trace(
 					logger.LT_Leader,
 					"%%%d drop an stale sendInstallSnapshot response(sent on term %d) on current term %d\n",
 					rf.me, replicateTerm, rf.CurrentTerm,
@@ -964,7 +968,7 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 				rf.mu.Unlock()
 				return false
 			} else {
-				logger.Info(
+				raftLog.Info(
 					logger.LT_Snap,
 					"%%%d succeeded in InstallSnapshot(Index %d, Term %d) to %%%d on term %d\n",
 					rf.me, args.LastIncludedIndex, args.LastIncludedTerm, client, rf.CurrentTerm,
@@ -1003,7 +1007,7 @@ func (rf *Raft) startElection() bool {
 		lastLogIndex = rf.logLength() - 1
 		lastLogTerm = rf.logAtIndex(lastLogIndex).Term
 	}
-	logger.Info(
+	raftLog.Info(
 		logger.LT_Vote, "%%%d starts an election on term %d\n", rf.me, electionTerm,
 	)
 	rf.voteCount++ // Vote for itself
@@ -1025,14 +1029,14 @@ func (rf *Raft) startElection() bool {
 				LastLogTerm:  lastLogTerm,
 			}
 			reply := RequestVoteReply{}
-			logger.Trace(
+			raftLog.Trace(
 				logger.LT_Vote, "%%%d request %%%d to vote on term %d\n",
 				rf.me, n, electionTerm,
 			)
 			for {
 				ok := rf.sendRequestVote(n, &args, &reply)
 				if rf.killed() {
-					logger.Trace(
+					raftLog.Trace(
 						logger.LT_Vote, "%%%d stop request vote since it has been killed\n", rf.me,
 					)
 					return
@@ -1041,7 +1045,7 @@ func (rf *Raft) startElection() bool {
 				} else {
 					rf.mu.Lock()
 					if electionTerm != rf.CurrentTerm {
-						logger.Trace(logger.LT_Vote, "%%%d cancel an old vote requst(sent on term %d) to %%%d\n", rf.me, electionTerm, n)
+						raftLog.Trace(logger.LT_Vote, "%%%d cancel an old vote requst(sent on term %d) to %%%d\n", rf.me, electionTerm, n)
 					}
 					rf.mu.Unlock()
 					return
@@ -1050,7 +1054,7 @@ func (rf *Raft) startElection() bool {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			logger.Trace(
+			raftLog.Trace(
 				logger.LT_Vote, "%%%d get reply from %%%d(vote for me: %v) on term %d\n",
 				rf.me, n, reply.VoteGranted, rf.CurrentTerm,
 			)
@@ -1069,7 +1073,7 @@ func (rf *Raft) startElection() bool {
 			if rf.voteCount > len(rf.peers)/2 {
 				isElectionFinished = true // Election finished after win the majority votes
 				if electionTerm != rf.CurrentTerm {
-					logger.Warn(
+					raftLog.Debug(
 						logger.LT_Vote, "%%%d: a belated win(start at term %d, now on term %d)\n",
 						rf.me, electionTerm, rf.CurrentTerm,
 					)
@@ -1080,7 +1084,7 @@ func (rf *Raft) startElection() bool {
 					rf.nextIndex[j] = rf.logLength()
 					rf.matchIndex[j] = 0
 				}
-				logger.Info(
+				raftLog.Info(
 					logger.LT_Vote, "%%%d won election on term %d\n", rf.me, rf.CurrentTerm,
 				)
 
@@ -1107,7 +1111,7 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 	for replicateCount < majority {
 		client := <-finishedClient
 		replicateCount++
-		logger.Trace(
+		raftLog.Trace(
 			logger.LT_Commit,
 			"%%%d was notified a replicate to %%%d finished(total finished count %d)\n",
 			rf.me, client, replicateCount,
@@ -1116,7 +1120,7 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	logger.Trace(
+	raftLog.Trace(
 		logger.LT_Commit, "%%%d get enough replication count %d on term %d\n",
 		rf.me, replicateCount, rf.CurrentTerm,
 	)
@@ -1125,7 +1129,7 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 	var i int
 	countLength := rf.logLength() - 1 - rf.commitIndex
 	if countLength == 0 {
-		logger.Trace(
+		raftLog.Trace(
 			logger.LT_Commit, "%%%d: stale command committed on term %d\n",
 			rf.me, rf.CurrentTerm,
 		)
@@ -1143,11 +1147,11 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 			}
 		}
 	}
-	logger.Trace(logger.LT_Commit, "%%%d replic count: %v\n", rf.me, count)
+	raftLog.Trace(logger.LT_Commit, "%%%d replic count: %v\n", rf.me, count)
 	for i = countLength - 1; i >= 0; i-- {
 		if count[i] >= majority && rf.logAtIndex(rf.commitIndex+1+i).Term == rf.CurrentTerm {
 			newCommitIndex := rf.commitIndex + 1 + i
-			logger.Debug(
+			raftLog.Debug(
 				logger.LT_Leader, "%%%d update commitIndex(from %d to %d) on term %d\n",
 				rf.me, rf.commitIndex, newCommitIndex, rf.CurrentTerm,
 			)
@@ -1169,7 +1173,7 @@ func (rf *Raft) applier() {
 		} else if rf.lastAppiled < rf.commitIndex {
 			for {
 				if rf.lastAppiled >= rf.logLength() {
-					logger.Error(
+					raftLog.Error(
 						logger.LT_APPLIER, "%%%d: index(lastAppiled %d) out of range(log length %d)\n",
 						rf.me, rf.lastAppiled, rf.logLength(),
 					)
@@ -1183,7 +1187,7 @@ func (rf *Raft) applier() {
 				rf.mu.Unlock()
 				rf.applyCh <- msg
 				rf.mu.Lock()
-				logger.Info(
+				raftLog.Info(
 					logger.LT_APPLIER, "%%%d applied <Command: %d, Command Index %d> on term %d\n",
 					rf.me, msg.Command, msg.CommandIndex, rf.CurrentTerm,
 				)
@@ -1192,7 +1196,7 @@ func (rf *Raft) applier() {
 				}
 			}
 		} else if rf.lastAppiled > rf.commitIndex {
-			logger.Error(
+			raftLog.Error(
 				logger.LT_APPLIER, "%%%d: lastAppiled %d > commitIndex %d\n",
 				rf.me, rf.lastAppiled, rf.commitIndex,
 			)
@@ -1225,7 +1229,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if isLeader {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			logger.Info(
+			raftLog.Info(
 				logger.LT_Commit, "%%%d received command %v on term %d\n",
 				rf.me, command, rf.CurrentTerm,
 			)
@@ -1268,9 +1272,9 @@ func (rf *Raft) ticker() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
-		// logger.Trace(logger.LT_Timer, "%%%d attempt tick\n", rf.me)
+		// raftLog.Trace(logger.LT_Timer, "%%%d attempt tick\n", rf.me)
 		rf.mu.Lock()
-		logger.Trace(logger.LT_Timer, "%%%d tick on term %d\n", rf.me, rf.CurrentTerm)
+		raftLog.Trace(logger.LT_Timer, "%%%d tick on term %d\n", rf.me, rf.CurrentTerm)
 		rf.mu.Unlock()
 
 		if !rf.startElection() { // 检查是否有必要选举
@@ -1329,7 +1333,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// commitIndex和lastApplied>=0
 	rf.commitIndex = max(0, rf.snapshotIndex)
 	rf.lastAppiled = max(0, rf.snapshotIndex)
-	logger.Info(logger.LT_Log, "%%%d had been made\n", rf.me)
+	raftLog.Info(logger.LT_Log, "%%%d had been made\n", rf.me)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
