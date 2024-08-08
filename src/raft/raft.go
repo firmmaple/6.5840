@@ -444,8 +444,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XLen = rf.logLength()
 		raftLog.Debug(
 			logger.LT_Client,
-			"%%%d only has %d entries. PrevLogIndex %d is too long\n",
-			rf.me, rf.logLength(), args.PrevLogIndex,
+			"%%%d received AppendEntries from leader %%%d but failed: only has %d entries. PrevLogIndex %d is too long\n",
+			rf.me,
+			args.LeaderId,
+			rf.logLength(),
+			args.PrevLogIndex,
 		)
 		return
 	}
@@ -524,7 +527,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Sucess = true
-	if args.LeaderCommit > rf.commitIndex {
+	if args.LeaderCommit > rf.commitIndex && args.PrevLogIndex+len(args.Entries) > rf.commitIndex {
+		// 这边需要加入一个额外的判断条件 args.PrevLogIndex + len(args.Entries) > rf.commitIndex
+		// 假设此刻的情形如下，nextIndex[follower] = 4，Follower的commitIndex = 3，leader的commitIndex=4
+		// Index:     1 2 3 4 5
+		// Follower:  4 4 4 4
+		// Leader:    4 4 4 5 6
+		// 当Leader发送AppendEntries时会发生case 2的冲突，于是Leader将nextIndex[follower]调整为3
+		// 就当Leader再次发送AppendEntries前，Leader发出了一个Heatbeat(PrevLogIndex=2, LeaderCommitIndex=4)
+		// 这时就会出现错误，follower的commitIndex会变成2了
 		originCommitIndex := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 		raftLog.Debug(
@@ -892,6 +903,7 @@ func (rf *Raft) replicate(
 						logger.LT_Leader, "%d fast backup case 2 - leadder has XTerm %d and its last index is %d\n",
 						rf.me, reply.XTerm, lastEntryIndex,
 					)
+					// 感觉改为rf.nextIndex[client] = lastEntryIndex + 1也行？
 					rf.nextIndex[client] = lastEntryIndex
 				}
 				raftLog.Debug(
