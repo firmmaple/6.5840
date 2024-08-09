@@ -19,8 +19,10 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,8 +42,11 @@ const (
 
 const MS_HEARTBEAT_INTERVAL = 100
 
-var raftLog = logger.NewLogger(logger.LL_TRACE, os.Stdout, "RAFT")
 // var raftLog = logger.NewLogger(logger.LL_WARN, os.Stdout, "RAFT")
+
+var raftLog = logger.NewLogger(logger.LL_DEBUG, os.Stdout, "RAFT")
+
+// var raftLog = logger.NewLogger(logger.LL_INFO, os.Stdout, "RAFT")
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -69,6 +74,26 @@ type logEntry struct {
 	Command interface{}
 }
 
+type Log []logEntry
+
+func (log Log) String() string {
+	logLen := len(log)
+	if logLen > 5 {
+		return fmt.Sprintf(
+			"<Total Entries Num %d - %v   %v   .....   %v   %v>",
+			logLen, log[0], log[1], log[logLen-2], log[logLen-1],
+		)
+	} else if logLen == 1 {
+		return fmt.Sprintf("%v", log[0])
+	} else {
+		entries := make([]string, logLen)
+		for i, entry := range log {
+			entries[i] = fmt.Sprintf("%v", entry)
+		}
+		return fmt.Sprintf("<Entries Num %d - %v>", logLen, strings.Join(entries, "   "))
+	}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -80,17 +105,17 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	CurrentTerm    int           // latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	VotedFor       int           // candidateId that received vote in current term (or -1 if none)
+	currentTerm    int           // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor       int           // candidateId that received vote in current term (or -1 if none)
 	hasReceivedMsg bool          // 在两次tick之间，server是否有收到来自leader的请求
 	voteCount      int           // 在选举时，Candiadate收到的选票数目
 	eState         electionState // 用于表示server的状态，是Leader、Candidate还是Follower
 
-	Log         []logEntry // log entries
-	commitIndex int        // index of highest log entry known to be committed (initialized to 0)
-	lastAppiled int        // index of highest log entry applied to state machine (initialized to 0)
-	nextIndex   []int      // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	matchIndex  []int      // for each server, index of highest log entry known to be replicated on server (initialized to 0)
+	log         Log   // log entries
+	commitIndex int   // index of highest log entry known to be committed (initialized to 0)
+	lastAppiled int   // index of highest log entry applied to state machine (initialized to 0)
+	nextIndex   []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex  []int // for each server, index of highest log entry known to be replicated on server (initialized to 0)
 	cond        sync.Cond
 	applyCh     chan ApplyMsg
 
@@ -107,7 +132,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (3A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	term = rf.CurrentTerm
+	term = rf.currentTerm
 	isleader = (rf.eState == LEADER)
 	return term, isleader
 }
@@ -130,13 +155,13 @@ func (rf *Raft) hasTerm(term int, index int) int {
 
 // logLength 返回实际日志长度，包括已被快照压缩的日志部分
 func (rf *Raft) logLength() int {
-	return rf.snapshotIndex + 1 + len(rf.Log)
+	return rf.snapshotIndex + 1 + len(rf.log)
 }
 
 // logAtIndex 返回给定索引index处的日志条目
 // 调用者必须确保index大于快照中包含的最后一个条目的索引，即 index > snapshotIndex
 func (rf *Raft) logAtIndex(index int) logEntry {
-	if index-rf.snapshotLength() < 0 || index-rf.snapshotLength() >= len(rf.Log) {
+	if index-rf.snapshotLength() < 0 || index-rf.snapshotLength() >= len(rf.log) {
 		raftLog.Warn(
 			logger.LT_Log,
 			"%%%d: log index out of range - index: %d, snapshot length: %d\n",
@@ -144,11 +169,11 @@ func (rf *Raft) logAtIndex(index int) logEntry {
 		)
 		// 不做错误处理，因为程序运行到这里说明调用者的逻辑存在问题
 	}
-	return rf.Log[index-rf.snapshotLength()]
+	return rf.log[index-rf.snapshotLength()]
 }
 
 // logSlice 返回从索引 start 到 end 的 Log 切片（不包括索引 end），即[start, end)
-func (rf *Raft) logSlice(start int, end int) []logEntry {
+func (rf *Raft) logSlice(start int, end int) Log {
 	// 参数start和end需要符合如下条件：
 	// snapshotLength <= start <= end <= logLength
 	// 如不符合，则调整 start 和 end， 确保它们位于的有效范围内
@@ -166,14 +191,14 @@ func (rf *Raft) logSlice(start int, end int) []logEntry {
 		start = end
 	}
 
-	return rf.Log[start:end]
+	return rf.log[start:end]
 }
 
 func (rf *Raft) lastLogEntry() logEntry {
-	if len(rf.Log) == 0 {
+	if len(rf.log) == 0 {
 		return logEntry{Term: rf.snapshotTerm}
 	}
-	return rf.Log[len(rf.Log)-1]
+	return rf.log[len(rf.log)-1]
 }
 
 // snapshotLength 返回快照中包含的日志条目总数（或者说快照压缩了多少长度的日志）
@@ -193,18 +218,18 @@ func (rf *Raft) persist() {
 	// Your code here (3C).
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	if e.Encode(rf.CurrentTerm) != nil || e.Encode(rf.VotedFor) != nil || e.Encode(rf.Log) != nil ||
+	if e.Encode(rf.currentTerm) != nil || e.Encode(rf.votedFor) != nil || e.Encode(rf.log) != nil ||
 		e.Encode(rf.snapshotIndex) != nil || e.Encode(rf.snapshotTerm) != nil {
 		raftLog.Errorln(logger.LT_Persist, "Failed to encode some fields")
 	}
 
-	if e.Encode(rf.CurrentTerm) != nil {
-		raftLog.Error(logger.LT_Persist, "%%%d: Encode CurrentTerm: %d", rf.me, rf.CurrentTerm)
+	if e.Encode(rf.currentTerm) != nil {
+		raftLog.Error(logger.LT_Persist, "%%%d: Encode CurrentTerm: %d", rf.me, rf.currentTerm)
 	}
-	if e.Encode(rf.VotedFor) != nil {
-		raftLog.Error(logger.LT_Persist, "%%%d: Failed to encode VotedFor: %d", rf.me, rf.VotedFor)
+	if e.Encode(rf.votedFor) != nil {
+		raftLog.Error(logger.LT_Persist, "%%%d: Failed to encode VotedFor: %d", rf.me, rf.votedFor)
 	}
-	if e.Encode(rf.Log) != nil {
+	if e.Encode(rf.log) != nil {
 		raftLog.Error(logger.LT_Persist, "%%%d: Failed to encode Log", rf.me)
 	}
 	if e.Encode(rf.snapshotIndex) != nil {
@@ -219,7 +244,7 @@ func (rf *Raft) persist() {
 	raftLog.Trace(
 		logger.LT_Persist,
 		"%%%d persisted Raft state: Term %d, VotedFor %d, LogLen %d, Snapshot(Index %d, Term %d)\n",
-		rf.me, rf.CurrentTerm, rf.VotedFor, rf.logLength(), rf.snapshotIndex, rf.snapshotTerm,
+		rf.me, rf.currentTerm, rf.votedFor, rf.logLength(), rf.snapshotIndex, rf.snapshotTerm,
 	)
 }
 
@@ -234,13 +259,13 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
-	if err := d.Decode(&rf.CurrentTerm); err != nil {
+	if err := d.Decode(&rf.currentTerm); err != nil {
 		raftLog.Error(logger.LT_Persist, "%%%d: error decoding currentTerm: %v\n", rf.me, err)
 	}
-	if err := d.Decode(&rf.VotedFor); err != nil {
+	if err := d.Decode(&rf.votedFor); err != nil {
 		raftLog.Error(logger.LT_Persist, "%%%d: error decoding votedFor: %v\n", rf.me, err)
 	}
-	if err := d.Decode(&rf.Log); err != nil {
+	if err := d.Decode(&rf.log); err != nil {
 		raftLog.Error(logger.LT_Persist, "%%%d: error decoding log: %v\n", rf.me, err)
 	}
 	if err := d.Decode(&rf.snapshotIndex); err != nil {
@@ -254,7 +279,7 @@ func (rf *Raft) readPersist(data []byte) {
 	raftLog.Trace(
 		logger.LT_Persist,
 		"%%%d read Raft state: Term %d, VotedFor %d, LogLen %d, Snapshot(Index %d, Term %d)\n",
-		rf.me, rf.CurrentTerm, rf.VotedFor, rf.logLength(), rf.snapshotIndex, rf.snapshotTerm,
+		rf.me, rf.currentTerm, rf.votedFor, rf.logLength(), rf.snapshotIndex, rf.snapshotTerm,
 	)
 }
 
@@ -270,11 +295,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	raftLog.Debug(
 		logger.LT_Snap,
 		"%%%d attempt to create a snapshot up to index %d(last log index %d) on term %d\n",
-		rf.me, index, rf.logLength()-1, rf.CurrentTerm,
+		rf.me, index, rf.logLength()-1, rf.currentTerm,
 	)
 	// 下面三行代码顺序非常重要，不能变动
 	rf.snapshotTerm = rf.logAtIndex(index).Term
-	rf.Log = rf.logSlice(index+1, -1)
+	rf.log = rf.logSlice(index+1, -1)
 	rf.snapshotIndex = index
 	rf.snapshot = snapshot
 }
@@ -298,12 +323,12 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term         int        // Leader's term
-	LeaderId     int        // So follower can redirect clients
-	PrevLogIndex int        // index of log entry immediately preceding new ones
-	PrevLogTerm  int        // term of prevLogIndex entry
-	Entries      []logEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommit int        // leader's commitIndex
+	Term         int // Leader's term
+	LeaderId     int // So follower can redirect clients
+	PrevLogIndex int // index of log entry immediately preceding new ones
+	PrevLogTerm  int // term of prevLogIndex entry
+	Entries      Log // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int // leader's commitIndex
 }
 
 type AppendEntriesReply struct {
@@ -336,28 +361,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Set default reply
 	reply.VoteGranted = false
-	reply.Term = rf.CurrentTerm
+	reply.Term = rf.currentTerm
 
-	if args.Term < rf.CurrentTerm {
+	if args.Term < rf.currentTerm {
 		raftLog.Debug(
 			logger.LT_Vote,
 			"%%%d received stale RequestVote RPC from candidate %%%d(stale term: %d) on term %d\n",
-			rf.me, args.CandidateID, args.Term, rf.CurrentTerm,
+			rf.me, args.CandidateID, args.Term, rf.currentTerm,
 		)
 		return
-	} else if args.Term > rf.CurrentTerm {
+	} else if args.Term > rf.currentTerm {
 		rf.eState = FOLLOWER
-		rf.VotedFor = -1
-		rf.CurrentTerm = args.Term
-		raftLog.Debug(logger.LT_Vote, "%%%d converted to follower on term %d\n", rf.me, rf.CurrentTerm)
+		rf.votedFor = -1
+		rf.currentTerm = args.Term
+		raftLog.Debug(logger.LT_Vote, "%%%d converted to follower on term %d\n", rf.me, rf.currentTerm)
 	}
 
 	// 判断server是否在当前term，已将把选票投给其他candidate
-	if rf.VotedFor != -1 && rf.VotedFor != args.CandidateID {
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
 		raftLog.Debug(
 			logger.LT_Vote,
 			"%%%d refused to vote for candidate %%%d(it has already voted for %%%d) on term %d\n",
-			rf.me, args.CandidateID, rf.VotedFor, rf.CurrentTerm,
+			rf.me, args.CandidateID, rf.votedFor, rf.currentTerm,
 		)
 		return
 	}
@@ -369,16 +394,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// or
 	// 2. they have the same term, but A's log is longer the B
 	lastLogTerm := rf.snapshotTerm
-	if len(rf.Log) != 0 {
+	if len(rf.log) != 0 {
 		lastLogTerm = rf.logAtIndex(rf.logLength() - 1).Term
 	}
 	if args.LastLogTerm > lastLogTerm { // 候选人的日志任期号较高，授予投票
-		rf.VotedFor = args.CandidateID
+		rf.votedFor = args.CandidateID
 		reply.VoteGranted = true
 		rf.hasReceivedMsg = true
 		raftLog.Debug(
 			logger.LT_Vote, "%%%d votes for candidate %%%d on term %d\n",
-			rf.me, args.CandidateID, rf.CurrentTerm,
+			rf.me, args.CandidateID, rf.currentTerm,
 		)
 	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex+1 >= rf.logLength() {
 		// 候选人的日志任期号相同且日志长度不短于本服务器，授予投票
@@ -386,14 +411,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.hasReceivedMsg = true
 		raftLog.Debug(
 			logger.LT_Vote, "%%%d votes for candidate %%%d(has voted in currently term: %v) on term %d\n",
-			rf.me, args.CandidateID, rf.VotedFor == args.CandidateID, rf.CurrentTerm,
+			rf.me, args.CandidateID, rf.votedFor == args.CandidateID, rf.currentTerm,
 		)
-		rf.VotedFor = args.CandidateID
+		rf.votedFor = args.CandidateID
 	} else {
 		// 候选人的日志不如本服务器的日志新，拒绝投票
 		raftLog.Debug(
 			logger.LT_Vote, "%%%d refused to vote for candidate %%%d since it is more update-to-date on term %d\n",
-			rf.me, args.CandidateID, rf.CurrentTerm,
+			rf.me, args.CandidateID, rf.currentTerm,
 		)
 	}
 
@@ -406,31 +431,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.persist() // LIFO
 
 	// Set default reply
-	reply.Term = rf.CurrentTerm
+	reply.Term = rf.currentTerm
 	reply.Sucess = false
 
-	if args.Term < rf.CurrentTerm {
+	if args.Term < rf.currentTerm {
 		raftLog.Debug(
 			logger.LT_Client,
 			"%%%d received stale AppendEntries RPC from leader %%%d (stale term: %d) on term %d\n",
-			rf.me, args.LeaderId, args.Term, rf.CurrentTerm,
+			rf.me, args.LeaderId, args.Term, rf.currentTerm,
 		)
 		return
-	} else if args.Term > rf.CurrentTerm {
-		rf.CurrentTerm = args.Term
+	} else if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
 		rf.eState = FOLLOWER
 		raftLog.Debug(
-			logger.LT_Client, "%%%d updated its term to %d\n", rf.me, rf.CurrentTerm,
+			logger.LT_Client, "%%%d updated its term to %d\n", rf.me, rf.currentTerm,
 		)
-		rf.VotedFor = args.LeaderId
+		rf.votedFor = args.LeaderId
 	} else if rf.eState == CANDIDATE {
 		// If AppendEntries RPC received from new leader: convert to follower
 		rf.eState = FOLLOWER
-		rf.VotedFor = args.LeaderId
+		rf.votedFor = args.LeaderId
 		raftLog.Debug(
 			logger.LT_Candidate,
 			"%%%d abstained from election on term %d\n",
-			rf.me, rf.CurrentTerm,
+			rf.me, rf.currentTerm,
 		)
 	}
 
@@ -444,8 +469,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XLen = rf.logLength()
 		raftLog.Debug(
 			logger.LT_Client,
-			"%%%d received AppendEntries from leader %%%d but failed: only has %d entries. PrevLogIndex %d is too long\n",
+			"%%%d received AppendEntries(HeartBeat? %v) from leader %%%d but failed: only has %d entries. PrevLogIndex %d is too long\n",
 			rf.me,
+			len(args.Entries) == 0,
 			args.LeaderId,
 			rf.logLength(),
 			args.PrevLogIndex,
@@ -466,7 +492,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			raftLog.Error(
 				logger.LT_Client,
 				"%%%d inconsistency between snapshotTerm %d and PrevLogTerm %d on term %d\n",
-				rf.me, rf.snapshotTerm, args.PrevLogTerm, rf.CurrentTerm,
+				rf.me, rf.snapshotTerm, args.PrevLogTerm, rf.currentTerm,
 			)
 		}
 	} else if rf.logAtIndex(args.PrevLogIndex).Term != args.PrevLogTerm {
@@ -489,7 +515,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			logger.LT_Client,
 			"%%%d has entry[%d] conflicts with leader %%%d's [%d] at index %d on term %d\n",
 			rf.me, rf.logAtIndex(args.PrevLogIndex).Term,
-			args.LeaderId, args.PrevLogTerm, args.PrevLogIndex, rf.CurrentTerm,
+			args.LeaderId, args.PrevLogTerm, args.PrevLogIndex, rf.currentTerm,
 		)
 		return
 	}
@@ -498,7 +524,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		raftLog.Debug(
 			logger.LT_Client,
 			"%%%d received heartbeart(prev log index: %d) from leader %%%d on term %d\n",
-			rf.me, args.PrevLogIndex, args.LeaderId, rf.CurrentTerm,
+			rf.me, args.PrevLogIndex, args.LeaderId, rf.currentTerm,
 		)
 	}
 
@@ -514,13 +540,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.logAtIndex(entryIndex).Term != args.Entries[offset].Term {
 			// If an existing entry conflicts with a new one (same index but different terms),
 			// delete the existing entry and all that follow it
-			rf.Log = rf.logSlice(0, entryIndex)
+			rf.log = rf.logSlice(0, entryIndex)
 			// Append any new entries not already in the log
-			rf.Log = append(rf.Log, args.Entries[offset:]...)
+			rf.log = append(rf.log, args.Entries[offset:]...)
 			raftLog.Info(
 				logger.LT_Client,
 				"%%%d successfully append entry %v to itself, now has %d entries, on term %d\n",
-				rf.me, args.Entries[offset:], rf.logLength(), rf.CurrentTerm,
+				rf.me, args.Entries[offset:], rf.logLength(), rf.currentTerm,
 			)
 			break
 		}
@@ -541,7 +567,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		raftLog.Debug(
 			logger.LT_Client,
 			"%%%d follows its leader %%%d's commitIndex changing it from %d to %d on term %d\n",
-			rf.me, args.LeaderId, originCommitIndex, rf.commitIndex, rf.CurrentTerm,
+			rf.me, args.LeaderId, originCommitIndex, rf.commitIndex, rf.currentTerm,
 		)
 		rf.cond.Broadcast()
 	}
@@ -552,23 +578,23 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.mu.Unlock()
 
 	// Set default reply
-	reply.Term = rf.CurrentTerm
+	reply.Term = rf.currentTerm
 
 	// Rule 1: Reply immediately if term < currentTerm
-	if args.Term < rf.CurrentTerm {
+	if args.Term < rf.currentTerm {
 		raftLog.Debug(
 			logger.LT_Snap,
 			"%%%d received stale InstallSnapshot RPC(stale term: %d) on term %d\n",
-			rf.me, args.Term, rf.CurrentTerm,
+			rf.me, args.Term, rf.currentTerm,
 		)
 		return
-	} else if args.Term > rf.CurrentTerm {
-		rf.CurrentTerm = args.Term
+	} else if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
 		rf.eState = FOLLOWER
 		raftLog.Debug(
-			logger.LT_Snap, "%%%d update its term to %d\n", rf.me, rf.CurrentTerm,
+			logger.LT_Snap, "%%%d update its term to %d\n", rf.me, rf.currentTerm,
 		)
-		rf.VotedFor = args.LeaderId
+		rf.votedFor = args.LeaderId
 	}
 
 	rf.hasReceivedMsg = true
@@ -588,7 +614,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		raftLog.Trace(
 			logger.LT_Snap,
 			"%%%d received stale InstallSnapshot RPC(snapshot index: %d < %d) on term %d\n",
-			rf.me, args.LastIncludedIndex, rf.snapshotIndex, rf.CurrentTerm,
+			rf.me, args.LastIncludedIndex, rf.snapshotIndex, rf.currentTerm,
 		)
 		return
 	} else if rf.logLength()-1 < args.LastIncludedIndex {
@@ -598,11 +624,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.snapshotIndex = args.LastIncludedIndex
 		rf.snapshotTerm = args.LastIncludedTerm
 		rf.snapshot = args.Data
-		rf.Log = make([]logEntry, 0)
-		raftLog.Trace(
+		rf.log = make(Log, 0)
+		raftLog.Info(
 			logger.LT_Snap,
 			"%%%d updated its snapshot from index %d to %d on term %d\n",
-			rf.me, originalIndex, args.LastIncludedIndex, rf.CurrentTerm,
+			rf.me, originalIndex, args.LastIncludedIndex, rf.currentTerm,
 		)
 	} else {
 		// 快照的最后索引处于当前日志范围内，可能包含未知的新信息
@@ -615,11 +641,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			rf.snapshotIndex = args.LastIncludedIndex
 			rf.snapshotTerm = args.LastIncludedTerm
 			rf.snapshot = args.Data
-			rf.Log = make([]logEntry, 0)
+			rf.log = make(Log, 0)
 			raftLog.Info(
 				logger.LT_Snap,
 				"%%%d discarded entrie log(length %d) and created snapshot(index %d -> %d) on term %d\n",
-				rf.me, originalLogLength, originalSnapshotIndex, args.LastIncludedIndex, rf.CurrentTerm,
+				rf.me, originalLogLength, originalSnapshotIndex, args.LastIncludedIndex, rf.currentTerm,
 			)
 		} else {
 			// Rule 6: If existing log entry has same index and term as snapshot’s
@@ -645,7 +671,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	raftLog.Info(
 		logger.LT_APPLIER, "%%%d applied <Snapshot Index %d, Snapshot Term %d> on term %d\n",
-		rf.me, msg.SnapshotIndex, msg.SnapshotTerm, rf.CurrentTerm,
+		rf.me, msg.SnapshotIndex, msg.SnapshotTerm, rf.currentTerm,
 	)
 }
 
@@ -732,21 +758,21 @@ func (rf *Raft) sendHeartBeat(server int, sentTerm int) {
 		raftLog.Debug(
 			logger.LT_Leader,
 			"%%%d cannot send heartbeat(sent on term %d) to %d on term %d\n",
-			rf.me, sentTerm, server, rf.CurrentTerm,
+			rf.me, sentTerm, server, rf.currentTerm,
 		)
 		return
 	}
 	raftLog.Debug(
 		logger.LT_Leader,
 		"%%%d sent heartbeat to server %%%d on term %d, received reply on term %d\n",
-		rf.me, server, sentTerm, rf.CurrentTerm,
+		rf.me, server, sentTerm, rf.currentTerm,
 	)
-	if reply.Term > rf.CurrentTerm {
+	if reply.Term > rf.currentTerm {
 		rf.eState = FOLLOWER
-		rf.CurrentTerm = reply.Term
+		rf.currentTerm = reply.Term
 		raftLog.Debug(
 			logger.LT_Client, "%%%d update its term to %d and convert to follower\n",
-			rf.me, rf.CurrentTerm,
+			rf.me, rf.currentTerm,
 		)
 		rf.persist()
 	}
@@ -760,7 +786,7 @@ func (rf *Raft) heartBeatSender() {
 			rf.mu.Unlock()
 			return
 		}
-		sendTerm := rf.CurrentTerm
+		sendTerm := rf.currentTerm
 		rf.mu.Unlock()
 		for i := range rf.peers { // send heartbeat to each server
 			if i != rf.me {
@@ -812,7 +838,7 @@ func (rf *Raft) replicate(
 
 		// 如果不采用深拷贝，可能会产生data race
 		// RPC调用时读取args的Entries没有锁，这时候如果其他goroutine在写的话，会产生data race
-		entries := make([]logEntry, rf.logLength()-prevLogIndex-1)
+		entries := make(Log, rf.logLength()-prevLogIndex-1)
 		copy(entries, rf.logSlice(prevLogIndex+1, -1))
 		args := AppendEntriesArgs{
 			Term:         replicateTerm,
@@ -822,7 +848,7 @@ func (rf *Raft) replicate(
 			Entries:      entries,
 		}
 		reply := AppendEntriesReply{}
-		raftLog.Trace(
+		raftLog.Debug(
 			logger.LT_Leader, "%%%d attempt to replicate entries %v to %%%d on term %d\n",
 			rf.me, args.Entries, client, replicateTerm,
 		)
@@ -834,7 +860,7 @@ func (rf *Raft) replicate(
 			raftLog.Trace(
 				logger.LT_Leader,
 				"%%%d stop sendAppendEntries(killed: %v, leader: %v) on term %d\n",
-				rf.me, rf.killed(), rf.eState == LEADER, rf.CurrentTerm,
+				rf.me, rf.killed(), rf.eState == LEADER, rf.currentTerm,
 			)
 			rf.mu.Unlock()
 			return
@@ -853,26 +879,26 @@ func (rf *Raft) replicate(
 				raftLog.Info(
 					logger.LT_Leader,
 					"%%%d succeeded in replicating entry %v to %%%d(sent on term %d) on term %d\n",
-					rf.me, args.Entries, client, replicateTerm, rf.CurrentTerm,
+					rf.me, args.Entries, client, replicateTerm, rf.currentTerm,
 				)
 				break
 			} else {
-				if rf.CurrentTerm < reply.Term {
-					rf.CurrentTerm = reply.Term
+				if rf.currentTerm < reply.Term {
+					rf.currentTerm = reply.Term
 					rf.eState = FOLLOWER
 					raftLog.Debug(
 						logger.LT_Leader,
 						"%%%d update its term to %d and convert to follower\n",
-						rf.me, rf.CurrentTerm,
+						rf.me, rf.currentTerm,
 					)
 					rf.persist()
 					rf.mu.Unlock()
 					return
-				} else if rf.CurrentTerm > replicateTerm { // Simply drop the RPC response from the old term
+				} else if rf.currentTerm > replicateTerm { // Simply drop the RPC response from the old term
 					raftLog.Trace(
 						logger.LT_Leader,
 						"%%%d drop an old appendEntries response(sent on term %d) on current term %d\n",
-						rf.me, replicateTerm, rf.CurrentTerm,
+						rf.me, replicateTerm, rf.currentTerm,
 					)
 					rf.mu.Unlock()
 					return
@@ -909,11 +935,11 @@ func (rf *Raft) replicate(
 				raftLog.Debug(
 					logger.LT_Leader,
 					"%%%d: AppendEntries to %%%d failed(sent on term %d) beacause of inconsistency on term %d, retry again\n",
-					rf.me, client, replicateTerm, rf.CurrentTerm,
+					rf.me, client, replicateTerm, rf.currentTerm,
 				)
 			}
 		} else { // RPC failed
-			raftLog.Trace(
+			raftLog.Debug(
 				logger.LT_Leader,
 				"%%%d: AppendEntries(sent on term %d) to %%%d failed, try again\n",
 				rf.me, replicateTerm, client,
@@ -946,36 +972,36 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 			raftLog.Trace(
 				logger.LT_Snap,
 				"%%%d stop sendInstallSnapshot(killed: %v, leader: %v) on term %d\n",
-				rf.me, rf.killed(), rf.eState == LEADER, rf.CurrentTerm,
+				rf.me, rf.killed(), rf.eState == LEADER, rf.currentTerm,
 			)
 			rf.mu.Unlock()
 			return false
 		}
-		raftLog.Trace(
+		raftLog.Debug(
 			logger.LT_Leader,
 			"%%%d attempt to InstallSnapshot(Index %d, Term %d) to %%%d on term %d\n",
-			rf.me, args.LastIncludedIndex, args.LastIncludedTerm, client, rf.CurrentTerm,
+			rf.me, args.LastIncludedIndex, args.LastIncludedTerm, client, rf.currentTerm,
 		)
 		rf.mu.Unlock()
 
 		if rf.sendInstallSnapshot(client, &args, &reply) == true {
 			rf.mu.Lock()
-			if rf.CurrentTerm < reply.Term {
-				rf.CurrentTerm = reply.Term
+			if rf.currentTerm < reply.Term {
+				rf.currentTerm = reply.Term
 				rf.eState = FOLLOWER
-				raftLog.Trace(
+				raftLog.Debug(
 					logger.LT_Snap,
 					"%%%d update its term to %d and convert to follower\n",
-					rf.me, rf.CurrentTerm,
+					rf.me, rf.currentTerm,
 				)
 				rf.persist()
 				rf.mu.Unlock()
 				return false
-			} else if rf.CurrentTerm > replicateTerm { // Simply drop the RPC response from the old term
+			} else if rf.currentTerm > replicateTerm { // Simply drop the RPC response from the old term
 				raftLog.Trace(
 					logger.LT_Leader,
 					"%%%d drop an stale sendInstallSnapshot response(sent on term %d) on current term %d\n",
-					rf.me, replicateTerm, rf.CurrentTerm,
+					rf.me, replicateTerm, rf.currentTerm,
 				)
 				rf.mu.Unlock()
 				return false
@@ -983,7 +1009,7 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 				raftLog.Info(
 					logger.LT_Snap,
 					"%%%d succeeded in InstallSnapshot(Index %d, Term %d) to %%%d on term %d\n",
-					rf.me, args.LastIncludedIndex, args.LastIncludedTerm, client, rf.CurrentTerm,
+					rf.me, args.LastIncludedIndex, args.LastIncludedTerm, client, rf.currentTerm,
 				)
 				rf.mu.Unlock()
 				return true
@@ -1009,13 +1035,13 @@ func (rf *Raft) startElection() bool {
 	}
 
 	rf.voteCount = 0
-	rf.CurrentTerm++
+	rf.currentTerm++
 	rf.eState = CANDIDATE
-	electionTerm := rf.CurrentTerm
+	electionTerm := rf.currentTerm
 
 	lastLogIndex := rf.snapshotIndex
 	lastLogTerm := rf.snapshotTerm
-	if len(rf.Log) != 0 {
+	if len(rf.log) != 0 {
 		lastLogIndex = rf.logLength() - 1
 		lastLogTerm = rf.logAtIndex(lastLogIndex).Term
 	}
@@ -1023,7 +1049,7 @@ func (rf *Raft) startElection() bool {
 		logger.LT_Vote, "%%%d starts an election on term %d\n", rf.me, electionTerm,
 	)
 	rf.voteCount++ // Vote for itself
-	rf.VotedFor = rf.me
+	rf.votedFor = rf.me
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -1056,7 +1082,7 @@ func (rf *Raft) startElection() bool {
 					break
 				} else {
 					rf.mu.Lock()
-					if electionTerm != rf.CurrentTerm {
+					if electionTerm != rf.currentTerm {
 						raftLog.Trace(logger.LT_Vote, "%%%d cancel an old vote requst(sent on term %d) to %%%d\n", rf.me, electionTerm, n)
 					}
 					rf.mu.Unlock()
@@ -1068,11 +1094,11 @@ func (rf *Raft) startElection() bool {
 			defer rf.mu.Unlock()
 			raftLog.Trace(
 				logger.LT_Vote, "%%%d get reply from %%%d(vote for me: %v) on term %d\n",
-				rf.me, n, reply.VoteGranted, rf.CurrentTerm,
+				rf.me, n, reply.VoteGranted, rf.currentTerm,
 			)
 			if !reply.VoteGranted { // Get a rejection
-				if reply.Term > rf.CurrentTerm {
-					rf.CurrentTerm = reply.Term
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
 					rf.eState = FOLLOWER
 					rf.persist()
 				}
@@ -1084,10 +1110,10 @@ func (rf *Raft) startElection() bool {
 			}
 			if rf.voteCount > len(rf.peers)/2 {
 				isElectionFinished = true // Election finished after win the majority votes
-				if electionTerm != rf.CurrentTerm {
+				if electionTerm != rf.currentTerm {
 					raftLog.Debug(
 						logger.LT_Vote, "%%%d: a belated win(start at term %d, now on term %d)\n",
-						rf.me, electionTerm, rf.CurrentTerm,
+						rf.me, electionTerm, rf.currentTerm,
 					)
 					return
 				}
@@ -1097,7 +1123,7 @@ func (rf *Raft) startElection() bool {
 					rf.matchIndex[j] = 0
 				}
 				raftLog.Info(
-					logger.LT_Vote, "%%%d won election on term %d\n", rf.me, rf.CurrentTerm,
+					logger.LT_Vote, "%%%d won election on term %d\n", rf.me, rf.currentTerm,
 				)
 
 				go rf.heartBeatSender()
@@ -1134,7 +1160,7 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 	defer rf.mu.Unlock()
 	raftLog.Trace(
 		logger.LT_Commit, "%%%d get enough replication count %d on term %d\n",
-		rf.me, replicateCount, rf.CurrentTerm,
+		rf.me, replicateCount, rf.currentTerm,
 	)
 	// commitIndex+1  commitIndex+2 ... len(rf.log)-1
 	// 0              1             ... len(count)-1
@@ -1143,7 +1169,7 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 	if countLength == 0 {
 		raftLog.Trace(
 			logger.LT_Commit, "%%%d: stale command committed on term %d\n",
-			rf.me, rf.CurrentTerm,
+			rf.me, rf.currentTerm,
 		)
 		return
 	}
@@ -1161,11 +1187,11 @@ func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 	}
 	raftLog.Trace(logger.LT_Commit, "%%%d replic count: %v\n", rf.me, count)
 	for i = countLength - 1; i >= 0; i-- {
-		if count[i] >= majority && rf.logAtIndex(rf.commitIndex+1+i).Term == rf.CurrentTerm {
+		if count[i] >= majority && rf.logAtIndex(rf.commitIndex+1+i).Term == rf.currentTerm {
 			newCommitIndex := rf.commitIndex + 1 + i
 			raftLog.Debug(
 				logger.LT_Leader, "%%%d update commitIndex(from %d to %d) on term %d\n",
-				rf.me, rf.commitIndex, newCommitIndex, rf.CurrentTerm,
+				rf.me, rf.commitIndex, newCommitIndex, rf.currentTerm,
 			)
 			rf.commitIndex = newCommitIndex
 			rf.cond.Broadcast()
@@ -1181,6 +1207,7 @@ func (rf *Raft) applier() {
 	rf.mu.Lock()
 	for {
 		if rf.killed() {
+			close(rf.applyCh)
 			break
 		} else if rf.lastAppiled < rf.commitIndex {
 			for {
@@ -1201,7 +1228,7 @@ func (rf *Raft) applier() {
 				rf.mu.Lock()
 				raftLog.Info(
 					logger.LT_APPLIER, "%%%d applied <Command: %d, Command Index %d> on term %d\n",
-					rf.me, msg.Command, msg.CommandIndex, rf.CurrentTerm,
+					rf.me, msg.Command, msg.CommandIndex, rf.currentTerm,
 				)
 				if rf.lastAppiled == rf.commitIndex {
 					break
@@ -1243,12 +1270,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			defer rf.mu.Unlock()
 			raftLog.Info(
 				logger.LT_Commit, "%%%d received command %v on term %d\n",
-				rf.me, command, rf.CurrentTerm,
+				rf.me, command, rf.currentTerm,
 			)
 			// Append entry to local log
-			rf.Log = append(rf.Log, logEntry{Term: rf.CurrentTerm, Command: command})
+			rf.log = append(rf.log, logEntry{Term: rf.currentTerm, Command: command})
 			rf.persist()
-			replicateTerm := rf.CurrentTerm
+			replicateTerm := rf.currentTerm
 			lastLogIndex := rf.logLength() - 1
 			index = lastLogIndex
 			go rf.commit(replicateTerm, lastLogIndex)
@@ -1272,6 +1299,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	// unsafe
 	rf.cond.Broadcast()
+	// raftLog.Warn(logger.LT_Log, "%%%d killed\n", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -1286,7 +1314,7 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 		// raftLog.Trace(logger.LT_Timer, "%%%d attempt tick\n", rf.me)
 		rf.mu.Lock()
-		raftLog.Trace(logger.LT_Timer, "%%%d tick on term %d\n", rf.me, rf.CurrentTerm)
+		raftLog.Trace(logger.LT_Timer, "%%%d tick on term %d\n", rf.me, rf.currentTerm)
 		rf.mu.Unlock()
 
 		if !rf.startElection() { // 检查是否有必要选举
@@ -1320,8 +1348,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
-	rf.CurrentTerm = 0
-	rf.VotedFor = -1
+	rf.currentTerm = 0
+	rf.votedFor = -1
 	rf.hasReceivedMsg = false
 	rf.voteCount = 0
 	rf.eState = FOLLOWER
@@ -1330,8 +1358,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// A: You should view it as zero-indexed, but starting out with an entry
 	// (at index=0) that has term 0. That allows the very first AppendEntries
 	// RPC to contain 0 as PrevLogIndex, and be a valid index into the log.
-	rf.Log = make([]logEntry, 0)
-	rf.Log = append(rf.Log, logEntry{Term: 0})
+	rf.log = make(Log, 0)
+	rf.log = append(rf.log, logEntry{Term: 0})
 
 	rf.cond = *sync.NewCond(&rf.mu)
 	rf.nextIndex = make([]int, len(rf.peers))
