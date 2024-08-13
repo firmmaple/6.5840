@@ -44,9 +44,9 @@ const MS_HEARTBEAT_INTERVAL = 100
 
 // var raftLog = logger.NewLogger(logger.LL_WARN, os.Stdout, "RAFT")
 
-var raftLog = logger.NewLogger(logger.LL_DEBUG, os.Stdout, "RAFT")
-
 // var raftLog = logger.NewLogger(logger.LL_INFO, os.Stdout, "RAFT")
+// var raftLog = logger.NewLogger(logger.LL_DEBUG, os.Stdout, "RAFT")
+var raftLog = logger.NewLogger(logger.LL_TRACE, os.Stdout, "RAFT")
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -75,6 +75,10 @@ type logEntry struct {
 }
 
 type Log []logEntry
+
+func (entry logEntry) String() string {
+	return fmt.Sprintf("Term: %d - %v", entry.Term, entry.Command)
+}
 
 func (log Log) String() string {
 	logLen := len(log)
@@ -728,6 +732,10 @@ func (rf *Raft) sendInstallSnapshot(
 // 心跳的发送有助于保持领导者的权威并防止Follower超时转换为Candidate
 func (rf *Raft) sendHeartBeat(server int, sentTerm int) {
 	rf.mu.Lock()
+	if rf.eState != LEADER {
+		rf.mu.Unlock()
+		return
+	}
 	raftLog.Trace(
 		logger.LT_Leader, "%%%d attempt to send heartbeat to %%%d on term %d\n",
 		rf.me, server, sentTerm,
@@ -810,6 +818,10 @@ func (rf *Raft) replicate(
 		)
 		rf.mu.Unlock()
 		return
+	} else if rf.eState != LEADER {
+		raftLog.Trace(logger.LT_Client, "%%%d is not leader and stop replicating on term %d\n", rf.me, rf.currentTerm)
+		rf.mu.Unlock()
+		return
 	}
 
 	for {
@@ -846,11 +858,13 @@ func (rf *Raft) replicate(
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
 		}
 		reply := AppendEntriesReply{}
 		raftLog.Debug(
-			logger.LT_Leader, "%%%d attempt to replicate entries %v to %%%d on term %d\n",
-			rf.me, args.Entries, client, replicateTerm,
+			logger.LT_Leader,
+			"%%%d attempt to replicate entries %v to %%%d (Prev- Index: %d, Term: %d)on term %d\n",
+			rf.me, args.Entries, client, prevLogIndex, prevLogTerm, replicateTerm,
 		)
 		rf.mu.Unlock()
 
@@ -862,11 +876,10 @@ func (rf *Raft) replicate(
 				"%%%d stop sendAppendEntries(killed: %v, leader: %v) on term %d\n",
 				rf.me, rf.killed(), rf.eState == LEADER, rf.currentTerm,
 			)
-			rf.mu.Unlock()
-			return
+			break
 		} else if ok {
 			if reply.Sucess {
-				// Q: 这边matchIndex的计算为什么要取mac呢？
+				// Q: 这边matchIndex的计算为什么要取max呢？
 				// A: 假设目前 log = [nil, 1], matchIndex = 1, nextIndex = 2
 				// 然后client请求执行cmd 2，于是leader将2加入log，log = [nil, 1, 2]
 				// 然后leader发出replicate A，replicate [2]
@@ -881,6 +894,8 @@ func (rf *Raft) replicate(
 					"%%%d succeeded in replicating entry %v to %%%d(sent on term %d) on term %d\n",
 					rf.me, args.Entries, client, replicateTerm, rf.currentTerm,
 				)
+				// 用于leader统计有几个server完成了replicate
+				finishedClient <- client
 				break
 			} else {
 				if rf.currentTerm < reply.Term {
@@ -892,50 +907,21 @@ func (rf *Raft) replicate(
 						rf.me, rf.currentTerm,
 					)
 					rf.persist()
-					rf.mu.Unlock()
-					return
+					break
 				} else if rf.currentTerm > replicateTerm { // Simply drop the RPC response from the old term
 					raftLog.Trace(
 						logger.LT_Leader,
 						"%%%d drop an old appendEntries response(sent on term %d) on current term %d\n",
 						rf.me, replicateTerm, rf.currentTerm,
 					)
-					rf.mu.Unlock()
-					return
+					break
 				}
 
-				// Fast Backup https://www.youtube.com/watch?v=4r8Mz3MMivY&t=3655s
-				if reply.XLen <= args.PrevLogIndex {
-					// Case 3: follower's log is too short:
-					//   nextIndex = XLen
-					rf.nextIndex[client] = reply.XLen
-					raftLog.Trace(
-						logger.LT_Leader, "%d fast backup case 3 - follower's log is too short, only %d\n",
-						rf.me, reply.XLen,
-					)
-				} else if lastEntryIndex := rf.hasTerm(reply.XTerm, args.PrevLogIndex); lastEntryIndex == -1 {
-					// Case 1: leader doesn't have XTerm:
-					//   nextIndex = XIndex
-					raftLog.Trace(
-						logger.LT_Leader,
-						"%d fast backup case 1 - leader doesn't have the term %d and next index will be %d\n",
-						rf.me, reply.XTerm, reply.XIndex,
-					)
-					rf.nextIndex[client] = reply.XIndex
-				} else {
-					// Case 2: leader has XTerm:
-					//   nextIndex = leader's last entry for XTerm
-					raftLog.Trace(
-						logger.LT_Leader, "%d fast backup case 2 - leadder has XTerm %d and its last index is %d\n",
-						rf.me, reply.XTerm, lastEntryIndex,
-					)
-					// 感觉改为rf.nextIndex[client] = lastEntryIndex + 1也行？
-					rf.nextIndex[client] = lastEntryIndex
-				}
+				rf.nextIndex[client] = rf.fastbackup(&args, &reply)
 				raftLog.Debug(
 					logger.LT_Leader,
-					"%%%d: AppendEntries to %%%d failed(sent on term %d) beacause of inconsistency on term %d, retry again\n",
-					rf.me, client, replicateTerm, rf.currentTerm,
+					"%%%d: AppendEntries to %%%d failed(sent on term %d) because of inconsistency on term %d, retry again\n",
+					rf.me, client, replicateTerm, rf.currentTerm, rf.nextIndex[client],
 				)
 			}
 		} else { // RPC failed
@@ -947,9 +933,38 @@ func (rf *Raft) replicate(
 		}
 	}
 	rf.mu.Unlock()
+}
 
-	// 用于leader统计有几个server完成了replicate
-	finishedClient <- client
+func (rf *Raft) fastbackup(args *AppendEntriesArgs, reply *AppendEntriesReply) int {
+	// Fast Backup https://www.youtube.com/watch?v=4r8Mz3MMivY&t=3655s
+	if reply.XLen <= args.PrevLogIndex {
+		// Case 3: follower's log is too short:
+		//   nextIndex = XLen
+		raftLog.Trace(
+			logger.LT_Leader, "%d fast backup case 3 - follower's log is too short, only %d\n",
+			rf.me, reply.XLen,
+		)
+		return reply.XLen
+	} else if lastEntryIndex := rf.hasTerm(reply.XTerm, args.PrevLogIndex); lastEntryIndex == -1 {
+		// Case 1: leader doesn't have XTerm:
+		//   nextIndex = XIndex
+		raftLog.Trace(
+			logger.LT_Leader,
+			"%d fast backup case 1 - leader doesn't have the term %d and next index will be %d\n",
+			rf.me, reply.XTerm, reply.XIndex,
+		)
+		return reply.XIndex
+	} else {
+		// Case 2: leader has XTerm:
+		//   nextIndex = leader's last entry for XTerm
+		raftLog.Trace(
+			logger.LT_Leader, "%d fast backup case 2 - leadder has XTerm %d and its last index is %d\n",
+			rf.me, reply.XTerm, lastEntryIndex,
+		)
+		// 感觉改为rf.nextIndex[client] = lastEntryIndex + 1也行？
+		// rf.nextIndex[client] = lastEntryIndex
+		return lastEntryIndex
+	}
 }
 
 func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
@@ -1137,13 +1152,16 @@ func (rf *Raft) startElection() bool {
 
 func (rf *Raft) commit(replicateTerm int, lastLogIndex int) {
 	// Replicate
-	finishedClient := make(chan int)
+	// 通过使用有缓冲的channel，避免了当replicateCount达到majority时，
+	// 部分gorouting无法向channel写入数据而导致的死锁
+	finishedClient := make(chan int, len(rf.peers)-1)
 	for i := range rf.peers {
 		if i != rf.me {
 			go rf.replicate(i, replicateTerm, lastLogIndex, finishedClient)
 		}
 	}
 
+	// 等待，直到在majority上完成replicate
 	replicateCount := 1
 	majority := len(rf.peers)/2 + 1
 	for replicateCount < majority {
@@ -1227,8 +1245,8 @@ func (rf *Raft) applier() {
 				rf.applyCh <- msg
 				rf.mu.Lock()
 				raftLog.Info(
-					logger.LT_APPLIER, "%%%d applied <Command: %d, Command Index %d> on term %d\n",
-					rf.me, msg.Command, msg.CommandIndex, rf.currentTerm,
+					logger.LT_APPLIER, "%%%d applied <Command Index: %d, Command %v> on term %d\n",
+					rf.me, msg.CommandIndex, msg.Command, rf.currentTerm,
 				)
 				if rf.lastAppiled == rf.commitIndex {
 					break
@@ -1268,16 +1286,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if isLeader {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			raftLog.Info(
-				logger.LT_Commit, "%%%d received command %v on term %d\n",
-				rf.me, command, rf.currentTerm,
-			)
 			// Append entry to local log
 			rf.log = append(rf.log, logEntry{Term: rf.currentTerm, Command: command})
 			rf.persist()
 			replicateTerm := rf.currentTerm
 			lastLogIndex := rf.logLength() - 1
 			index = lastLogIndex
+			raftLog.Info(
+				logger.LT_Commit, "%%%d received command %v at index %v on term %d\n",
+				rf.me, command, index, rf.currentTerm,
+			)
 			go rf.commit(replicateTerm, lastLogIndex)
 		}
 	}

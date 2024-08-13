@@ -45,6 +45,8 @@ const (
 	LT_Trace     LogTopic = "TRCE"
 	LT_Vote      LogTopic = "VOTE"
 	LT_APPLIER   LogTopic = "APLY"
+	LT_CLERK     LogTopic = "CLRK"
+	LT_SERVER    LogTopic = "SRVR"
 )
 
 type Logger struct {

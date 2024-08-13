@@ -1,15 +1,24 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
+	"fmt"
 	"log"
+	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/logger"
+	"6.5840/raft"
 )
 
-const Debug = false
+const (
+	waitTimeoutInvervalMs = 1000
+	noopTickIntervalMs    = 1500
+	Debug                 = false
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +27,24 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OpType int
+
+const (
+	OP_GET OpType = iota
+	OP_PUT
+	OP_APPEND
+	OP_NOOP
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Seqno   int
+	ClerkId int
+	Type    OpType
+	Key     string
+	Value   string
 }
 
 type KVServer struct {
@@ -35,19 +57,205 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	nextOpSeqnoToExecute map[int]int
+	wakeupNotifications  map[int]notification
+	data                 map[string]string
 }
 
+type notification struct {
+	expectedSeqno int // 等待执行的opseqno
+	cond          *sync.Cond
+}
+
+func (n notification) notify() {
+	n.cond.Broadcast()
+}
+
+func (op Op) String() string {
+	var opType string
+	switch op.Type {
+	case OP_GET:
+		opType = "GET"
+	case OP_PUT:
+		opType = "PUT"
+	case OP_APPEND:
+		opType = "Append"
+	case OP_NOOP:
+		opType = "NoOp"
+	default:
+		opType = "Unknow OpType"
+	}
+	return fmt.Sprintf(
+		"%v<Seqno: %d, ClerkId: %d, Key: %v, Value: %v>",
+		opType, op.Seqno, op.ClerkId, op.Key, op.Value,
+	)
+}
+
+func (kv *KVServer) isLeader() bool {
+	_, isLeader := kv.rf.GetState()
+	return isLeader
+}
+
+func (kv *KVServer) isExecuted(op *Op) bool {
+	return op.Seqno < kv.nextOpSeqnoToExecute[op.ClerkId]
+}
+
+func (kv *KVServer) waitUntilOpExecuted(opPtr *Op) (Err, string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	_, _, isLeader := kv.rf.Start(*opPtr)
+	if !isLeader {
+		return ErrWrongLeader, ""
+	}
+
+	awakend := false
+	cond := sync.NewCond(&kv.mu)
+	kv.wakeupNotifications[opPtr.ClerkId] = notification{expectedSeqno: opPtr.Seqno, cond: cond}
+	go func() {
+		for {
+			<-time.After(time.Duration(waitTimeoutInvervalMs) * time.Millisecond)
+			kv.mu.Lock()
+			_, isLeader = kv.rf.GetState()
+			if !isLeader || awakend {
+				break
+			}
+			kv.mu.Unlock()
+		}
+		if !isLeader {
+			cond.Broadcast()
+		}
+		kv.mu.Unlock()
+	}()
+
+	cond.Wait()
+	if !isLeader {
+		kvLogger.Debug(logger.LT_SERVER, "%%%d leader change\n", kv.me)
+		return ErrLeaderChange, ""
+	}
+	awakend = true
+
+	// 好像不需要返回string？
+	return OK, kv.data[opPtr.Key]
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kvLogger.Debug(logger.LT_SERVER, "%%%d received Get RPC from clerk %%%d\n", kv.me, args.ClerkId)
+	opPtr := &Op{Seqno: args.OpSeqno, ClerkId: args.ClerkId, Type: OP_GET, Key: args.Key}
+	reply.Err = OK
+	kv.mu.Lock()
+	if kv.isExecuted(opPtr) {
+		// 第一个Get执行时间 <= 最近执行一条命令的时间 < 这个Get到达时间
+		// 所以尽管当前Server可能的数据可能是Stale的，但是直接返回仍然符合linearizable
+		reply.Value = kv.data[args.Key]
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	reply.Err, reply.Value = kv.waitUntilOpExecuted(opPtr)
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kvLogger.Debug(logger.LT_SERVER, "%%%d received Put RPC from clerk %%%d\n", kv.me, args.ClerkId)
+	opPtr := &Op{
+		Seqno: args.OpSeqno, ClerkId: args.ClerkId, Type: OP_PUT, Key: args.Key, Value: args.Value,
+	}
+	reply.Err = OK
+	kv.mu.Lock()
+	if kv.isExecuted(opPtr) {
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	reply.Err, _ = kv.waitUntilOpExecuted(opPtr)
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kvLogger.Debug(
+		logger.LT_SERVER, "%%%d received Append RPC from clerk %%%d\n",
+		kv.me, args.ClerkId,
+	)
+	opPtr := &Op{
+		Seqno: args.OpSeqno, ClerkId: args.ClerkId, Type: OP_APPEND, Key: args.Key, Value: args.Value,
+	}
+	reply.Err = OK
+	kv.mu.Lock()
+	if kv.isExecuted(opPtr) {
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	reply.Err, _ = kv.waitUntilOpExecuted(opPtr)
+}
+
+func (kv *KVServer) executor() {
+	// Raft被Kill时会关闭applyCh，因此executor线程可以正常退出
+	for applyMsg := range kv.applyCh {
+		kv.mu.Lock()
+		op, ok := applyMsg.Command.(Op) // 尝试将 Command 断言为 Op 类型
+		if !ok {
+			actualType := reflect.TypeOf(applyMsg.Command)
+			kvLogger.Error(
+				logger.LT_SERVER, "%%%d: Command is not of type *Op, actual type: %v\n",
+				kv.me, actualType,
+			)
+		}
+		if op.Type == OP_NOOP || kv.isExecuted(&op) {
+			kv.mu.Unlock()
+			continue
+		}
+		switch op.Type {
+		case OP_GET: // 好像啥都不用做？
+		case OP_PUT:
+			kv.data[op.Key] = op.Value
+		case OP_APPEND:
+			originalValue, ok := kv.data[op.Key]
+			if !ok {
+				originalValue = ""
+			}
+			kv.data[op.Key] = originalValue + op.Value
+		default:
+			kvLogger.Error(logger.LT_SERVER, "%%%d: Unknow Op Type %d\n", kv.me, op.Type)
+		}
+		kvLogger.Debug(logger.LT_SERVER, "%%%d executed OP %v\n", kv.me, op)
+		if kv.nextOpSeqnoToExecute[op.ClerkId] != op.Seqno {
+			kvLogger.Error(
+				logger.LT_SERVER, "%%%d: nextOpSeqno %d != op.Seqno %d \n",
+				kv.me, kv.nextOpSeqnoToExecute[op.ClerkId], op.Seqno,
+			)
+		}
+		kv.nextOpSeqnoToExecute[op.ClerkId]++
+		kvLogger.Debug(
+			logger.LT_SERVER, "%%%d updated nextOpSeqno of %%%d to %d\n",
+			kv.me, op.ClerkId, kv.nextOpSeqnoToExecute[op.ClerkId],
+		)
+		notification, ok := kv.wakeupNotifications[op.ClerkId]
+		if ok && op.Seqno == notification.expectedSeqno {
+			// 如果没有expectedSeqno的话会有一个问题
+			// 假设此刻Clerk %2发来一个Get命令(seqno 100)，但是在执行前Get命令前所有server都奔溃了
+			// server恢复后会从头执行所有命令，然后问题就会出现，
+			// 执行Clerk %2的第一个命令（seqno 0）时，会把等待Get命令的Clerk唤醒，相当于提前执行的Get命令
+			notification.notify()
+		}
+
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) noopTicker() {
+	for !kv.killed() {
+		if kv.isLeader() {
+			op := Op{Type: OP_NOOP}
+			kv.rf.Start(op)
+		}
+		time.Sleep(noopTickIntervalMs * time.Millisecond)
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -81,7 +289,9 @@ func (kv *KVServer) killed() bool {
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
-func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
+func StartKVServer(
+	servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int,
+) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
@@ -96,6 +306,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.data = make(map[string]string)
+	kv.nextOpSeqnoToExecute = make(map[int]int)
+	kv.wakeupNotifications = make(map[int]notification)
+
+	go kv.executor()
+	go kv.noopTicker()
 
 	return kv
 }
