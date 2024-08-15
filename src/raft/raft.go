@@ -222,10 +222,6 @@ func (rf *Raft) persist() {
 	// Your code here (3C).
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	if e.Encode(rf.currentTerm) != nil || e.Encode(rf.votedFor) != nil || e.Encode(rf.log) != nil ||
-		e.Encode(rf.snapshotIndex) != nil || e.Encode(rf.snapshotTerm) != nil {
-		raftLog.Errorln(logger.LT_Persist, "Failed to encode some fields")
-	}
 
 	if e.Encode(rf.currentTerm) != nil {
 		raftLog.Error(logger.LT_Persist, "%%%d: Encode CurrentTerm: %d", rf.me, rf.currentTerm)
@@ -296,6 +292,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
+	if index < rf.snapshotIndex {
+		raftLog.Trace(
+			logger.LT_Snap,
+			"%%%d already had a snapshot index(%d) more update than %d\n",
+			rf.me, rf.snapshotIndex, index,
+		)
+    return
+	}
 	raftLog.Debug(
 		logger.LT_Snap,
 		"%%%d attempt to create a snapshot up to index %d(last log index %d) on term %d\n",
@@ -670,9 +674,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  rf.snapshotTerm,
 		SnapshotIndex: rf.snapshotIndex,
 	}
-	rf.mu.Unlock()
 	rf.applyCh <- msg
-	rf.mu.Lock()
 	raftLog.Info(
 		logger.LT_APPLIER, "%%%d applied <Snapshot Index %d, Snapshot Term %d> on term %d\n",
 		rf.me, msg.SnapshotIndex, msg.SnapshotTerm, rf.currentTerm,
@@ -778,8 +780,9 @@ func (rf *Raft) sendHeartBeat(server int, sentTerm int) {
 	if reply.Term > rf.currentTerm {
 		rf.eState = FOLLOWER
 		rf.currentTerm = reply.Term
+		rf.votedFor = -1
 		raftLog.Debug(
-			logger.LT_Client, "%%%d update its term to %d and convert to follower\n",
+			logger.LT_Client, "%%%d update its term to %d and converted to follower\n",
 			rf.me, rf.currentTerm,
 		)
 		rf.persist()
@@ -901,9 +904,9 @@ func (rf *Raft) replicate(
 				if rf.currentTerm < reply.Term {
 					rf.currentTerm = reply.Term
 					rf.eState = FOLLOWER
+					rf.votedFor = -1
 					raftLog.Debug(
-						logger.LT_Leader,
-						"%%%d update its term to %d and convert to follower\n",
+						logger.LT_Leader, "%%%d updated its term to %d and converted to follower\n",
 						rf.me, rf.currentTerm,
 					)
 					rf.persist()
@@ -921,7 +924,7 @@ func (rf *Raft) replicate(
 				raftLog.Debug(
 					logger.LT_Leader,
 					"%%%d: AppendEntries to %%%d failed(sent on term %d) because of inconsistency on term %d, retry again\n",
-					rf.me, client, replicateTerm, rf.currentTerm, rf.nextIndex[client],
+					rf.me, client, replicateTerm, rf.currentTerm,
 				)
 			}
 		} else { // RPC failed
@@ -978,11 +981,11 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 		Data:              rf.snapshot,
 		Done:              true,
 	}
-	reply := InstallSnapshotReply{}
 	rf.mu.Unlock()
 
 	for {
 		rf.mu.Lock()
+		reply := InstallSnapshotReply{}
 		if rf.killed() || rf.eState != LEADER {
 			raftLog.Trace(
 				logger.LT_Snap,
@@ -1004,9 +1007,9 @@ func (rf *Raft) updateFollowerSnapshot(client int, replicateTerm int) bool {
 			if rf.currentTerm < reply.Term {
 				rf.currentTerm = reply.Term
 				rf.eState = FOLLOWER
+				rf.votedFor = client
 				raftLog.Debug(
-					logger.LT_Snap,
-					"%%%d update its term to %d and convert to follower\n",
+					logger.LT_Snap, "%%%d updated its term to %d and converted to follower\n",
 					rf.me, rf.currentTerm,
 				)
 				rf.persist()

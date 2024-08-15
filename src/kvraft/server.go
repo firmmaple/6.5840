@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"reflect"
@@ -17,6 +18,7 @@ import (
 const (
 	waitTimeoutInvervalMs = 1000
 	noopTickIntervalMs    = 1500
+	snapshotRatio         = 0.9
 	Debug                 = false
 )
 
@@ -57,6 +59,7 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister            *raft.Persister
 	nextOpSeqnoToExecute map[int]int
 	wakeupNotifications  map[int]notification
 	data                 map[string]string
@@ -100,6 +103,35 @@ func (kv *KVServer) isExecuted(op *Op) bool {
 	return op.Seqno < kv.nextOpSeqnoToExecute[op.ClerkId]
 }
 
+func (kv *KVServer) makeSnapshot(commandIndex int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.nextOpSeqnoToExecute) != nil || e.Encode(kv.data) != nil {
+		kvLogger.Errorln(logger.LT_Persist, "Failed to encode some fields")
+	}
+
+	kv.rf.Snapshot(commandIndex, w.Bytes())
+	kvLogger.Trace(
+		logger.LT_Persist, "%%%d made a snapshot up to commandIndex %d\n",
+		kv.me, commandIndex,
+	)
+}
+
+func (kv *KVServer) recoverFromSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		kvLogger.Trace(logger.LT_Persist, "%%%d bootstrap without snapshot\n", kv.me)
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&kv.nextOpSeqnoToExecute) != nil || d.Decode(&kv.data) != nil {
+		kvLogger.Errorln(logger.LT_Persist, "Failed to decode some fields")
+	}
+
+	kvLogger.Trace(logger.LT_Persist, "%%%d recovered from snapshot\n", kv.me)
+}
+
 func (kv *KVServer) waitUntilOpExecuted(opPtr *Op) (Err, string) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -122,18 +154,18 @@ func (kv *KVServer) waitUntilOpExecuted(opPtr *Op) (Err, string) {
 			}
 			kv.mu.Unlock()
 		}
-		if !isLeader {
+		if !awakend {
 			cond.Broadcast()
 		}
 		kv.mu.Unlock()
 	}()
 
 	cond.Wait()
+	awakend = true
 	if !isLeader {
 		kvLogger.Debug(logger.LT_SERVER, "%%%d leader change\n", kv.me)
 		return ErrLeaderChange, ""
 	}
-	awakend = true
 
 	// 好像不需要返回string？
 	return OK, kv.data[opPtr.Key]
@@ -141,10 +173,10 @@ func (kv *KVServer) waitUntilOpExecuted(opPtr *Op) (Err, string) {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	kvLogger.Debug(logger.LT_SERVER, "%%%d received Get RPC from clerk %%%d\n", kv.me, args.ClerkId)
 	opPtr := &Op{Seqno: args.OpSeqno, ClerkId: args.ClerkId, Type: OP_GET, Key: args.Key}
 	reply.Err = OK
 	kv.mu.Lock()
+	kvLogger.Debug(logger.LT_SERVER, "%%%d received Get RPC from clerk %%%d\n", kv.me, args.ClerkId)
 	if kv.isExecuted(opPtr) {
 		// 第一个Get执行时间 <= 最近执行一条命令的时间 < 这个Get到达时间
 		// 所以尽管当前Server可能的数据可能是Stale的，但是直接返回仍然符合linearizable
@@ -159,12 +191,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kvLogger.Debug(logger.LT_SERVER, "%%%d received Put RPC from clerk %%%d\n", kv.me, args.ClerkId)
+	// kvLogger.Debug(logger.LT_SERVER, "%%%d received Put RPC from clerk %%%d\n", kv.me, args.ClerkId)
 	opPtr := &Op{
 		Seqno: args.OpSeqno, ClerkId: args.ClerkId, Type: OP_PUT, Key: args.Key, Value: args.Value,
 	}
 	reply.Err = OK
 	kv.mu.Lock()
+	kvLogger.Debug(logger.LT_SERVER, "%%%d received Put RPC from clerk %%%d\n", kv.me, args.ClerkId)
 	if kv.isExecuted(opPtr) {
 		kv.mu.Unlock()
 		return
@@ -176,15 +209,15 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kvLogger.Debug(
-		logger.LT_SERVER, "%%%d received Append RPC from clerk %%%d\n",
-		kv.me, args.ClerkId,
-	)
 	opPtr := &Op{
 		Seqno: args.OpSeqno, ClerkId: args.ClerkId, Type: OP_APPEND, Key: args.Key, Value: args.Value,
 	}
 	reply.Err = OK
 	kv.mu.Lock()
+	kvLogger.Debug(
+		logger.LT_SERVER, "%%%d received Append RPC from clerk %%%d\n",
+		kv.me, args.ClerkId,
+	)
 	if kv.isExecuted(opPtr) {
 		kv.mu.Unlock()
 		return
@@ -198,6 +231,11 @@ func (kv *KVServer) executor() {
 	// Raft被Kill时会关闭applyCh，因此executor线程可以正常退出
 	for applyMsg := range kv.applyCh {
 		kv.mu.Lock()
+		if applyMsg.SnapshotValid {
+			kv.recoverFromSnapshot(applyMsg.Snapshot)
+			kv.mu.Unlock()
+			continue
+		}
 		op, ok := applyMsg.Command.(Op) // 尝试将 Command 断言为 Op 类型
 		if !ok {
 			actualType := reflect.TypeOf(applyMsg.Command)
@@ -232,9 +270,15 @@ func (kv *KVServer) executor() {
 		}
 		kv.nextOpSeqnoToExecute[op.ClerkId]++
 		kvLogger.Debug(
-			logger.LT_SERVER, "%%%d updated nextOpSeqno of %%%d to %d\n",
-			kv.me, op.ClerkId, kv.nextOpSeqnoToExecute[op.ClerkId],
+			logger.LT_SERVER, "%%%d updated nextOpSeqno of %%%d to %d(CommandIndex: %v)\n",
+			kv.me, op.ClerkId, kv.nextOpSeqnoToExecute[op.ClerkId], applyMsg.CommandIndex,
 		)
+
+		if kv.maxraftstate != -1 &&
+			float32(kv.persister.RaftStateSize()) > float32(kv.maxraftstate)*snapshotRatio {
+			kv.makeSnapshot(applyMsg.CommandIndex)
+		}
+
 		notification, ok := kv.wakeupNotifications[op.ClerkId]
 		if ok && op.Seqno == notification.expectedSeqno {
 			// 如果没有expectedSeqno的话会有一个问题
@@ -301,7 +345,7 @@ func StartKVServer(
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
@@ -309,6 +353,9 @@ func StartKVServer(
 	kv.data = make(map[string]string)
 	kv.nextOpSeqnoToExecute = make(map[int]int)
 	kv.wakeupNotifications = make(map[int]notification)
+	if maxraftstate != -1 {
+		kv.recoverFromSnapshot(persister.ReadSnapshot())
+	}
 
 	go kv.executor()
 	go kv.noopTicker()

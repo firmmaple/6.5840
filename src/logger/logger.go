@@ -23,10 +23,10 @@ const (
 
 var ll_desc = []string{"ALL", "TRACE", "DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"}
 
-var defaultLogger = NewLogger(LL_TRACE, os.Stdout, "")
+// var defaultLogger = NewLogger(LL_TRACE, os.Stdout, "")
 
 // var defaultLogger = NewLogger(LL_DEBUG, os.Stdout, "")
-// var defaultLogger = NewLogger(LL_INFO, os.Stdout, "")
+var defaultLogger = NewLogger(LL_INFO, os.Stdout, "")
 // var defaultLogger = NewLogger(LL_WARN, os.Stdout, "")
 
 const (
@@ -136,6 +136,7 @@ func (l *Logger) Warnln(topic LogTopic, message interface{}) {
 
 func (l *Logger) Errorln(topic LogTopic, message interface{}) {
 	l.SimpleLog(LL_ERROR, topic, message)
+	panic("ERROR")
 }
 
 func (l *Logger) Fatalln(topic LogTopic, message interface{}) {
