@@ -24,29 +24,31 @@ const (
 var ll_desc = []string{"ALL", "TRACE", "DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"}
 
 // var defaultLogger = NewLogger(LL_TRACE, os.Stdout, "")
-
 // var defaultLogger = NewLogger(LL_DEBUG, os.Stdout, "")
 var defaultLogger = NewLogger(LL_INFO, os.Stdout, "")
 // var defaultLogger = NewLogger(LL_WARN, os.Stdout, "")
 
 const (
-	LT_Client    LogTopic = "CLNT"
-	LT_Commit    LogTopic = "CMIT"
-	LT_Drop      LogTopic = "DROP"
-	LT_Leader    LogTopic = "LEAD"
-	LT_Candidate LogTopic = "CAND"
-	LT_Log       LogTopic = "LOG1"
-	LT_Log2      LogTopic = "LOG2"
-	LT_Persist   LogTopic = "PERS"
-	LT_Snap      LogTopic = "SNAP"
-	LT_Term      LogTopic = "TERM"
-	LT_Test      LogTopic = "TEST"
-	LT_Timer     LogTopic = "TIMR"
-	LT_Trace     LogTopic = "TRCE"
-	LT_Vote      LogTopic = "VOTE"
-	LT_APPLIER   LogTopic = "APLY"
-	LT_CLERK     LogTopic = "CLRK"
-	LT_SERVER    LogTopic = "SRVR"
+	LT_Client     LogTopic = "CLNT"
+	LT_Commit     LogTopic = "CMIT"
+	LT_Drop       LogTopic = "DROP"
+	LT_Leader     LogTopic = "LEAD"
+	LT_Candidate  LogTopic = "CAND"
+	LT_Log        LogTopic = "LOG1"
+	LT_Log2       LogTopic = "LOG2"
+	LT_Persist    LogTopic = "PERS"
+	LT_Snap       LogTopic = "SNAP"
+	LT_Term       LogTopic = "TERM"
+	LT_Test       LogTopic = "TEST"
+	LT_Timer      LogTopic = "TIMR"
+	LT_Trace      LogTopic = "TRCE"
+	LT_Vote       LogTopic = "VOTE"
+	LT_APPLIER    LogTopic = "APLY"
+	LT_CLERK      LogTopic = "CLRK"
+	LT_SERVER     LogTopic = "SRVR"
+	LT_CtrlServer LogTopic = "CTRL_SR"
+	LT_CtrlClerk  LogTopic = "CTRL_CK"
+	LT_Rebalance  LogTopic = "REBA"
 )
 
 type Logger struct {
@@ -63,6 +65,10 @@ func NewLogger(level LogLevel, out io.Writer, prefix string) *Logger {
 		prefix:     prefix,
 		debugStart: time.Now(),
 	}
+}
+
+func (l *Logger) SetLogLevel(level LogLevel) {
+	l.level = level
 }
 
 func (l *Logger) buildPrefix(level LogLevel, topic LogTopic) string {

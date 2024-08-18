@@ -1,5 +1,11 @@
 package shardkv
 
+import (
+	"os"
+
+	"6.5840/logger"
+)
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -9,12 +15,17 @@ package shardkv
 // You will have to modify these definitions.
 //
 
+const NShards = 10
+
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK              = "OK"
+	ErrNoKey        = "ErrNoKey"
+	ErrWrongGroup   = "ErrWrongGroup"
+	ErrWrongLeader  = "ErrWrongLeader"
+	ErrLeaderChange = "ErrLeaderChange"
 )
+
+var kvLogger = logger.NewLogger(logger.LL_TRACE, os.Stdout, "SHARD")
 
 type Err string
 
@@ -27,6 +38,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClerkId int
+	OpSeqno int
 }
 
 type PutAppendReply struct {
@@ -36,6 +49,8 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	ClerkId int
+	OpSeqno int
 }
 
 type GetReply struct {

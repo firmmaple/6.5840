@@ -1,5 +1,11 @@
 package shardctrler
 
+import (
+	"os"
+
+	"6.5840/logger"
+)
+
 //
 // Shard controller: assigns shards to replication groups.
 //
@@ -29,12 +35,20 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK              = "OK"
+	ErrWrongLeader  = "ErrWrongLeader"
+	ErrLeaderChange = "ErrLeaderChange"
 )
+
+// var scLogger = logger.NewLogger(logger.LL_TRACE, os.Stdout, "SHARD")
+// var scLogger = logger.NewLogger(logger.LL_DEBUG, os.Stdout, "SHARD")
+var scLogger = logger.NewLogger(logger.LL_INFO, os.Stdout, "SHARD")
 
 type Err string
 
 type JoinArgs struct {
+	ClerkId int
+	OpSeqno int
 	Servers map[int][]string // new GID -> servers mappings
 }
 
@@ -44,7 +58,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	ClerkId int
+	OpSeqno int
+	GIDs    []int
 }
 
 type LeaveReply struct {
@@ -53,8 +69,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	ClerkId int
+	OpSeqno int
+	Shard   int
+	GID     int
 }
 
 type MoveReply struct {
@@ -63,7 +81,9 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	ClerkId int
+	OpSeqno int
+	Num     int // desired config number
 }
 
 type QueryReply struct {

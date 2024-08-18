@@ -1,15 +1,19 @@
 package shardkv
 
-import "6.5840/porcupine"
-import "6.5840/models"
-import "testing"
-import "strconv"
-import "time"
-import "fmt"
-import "sync/atomic"
-import "sync"
-import "math/rand"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"6.5840/logger"
+	"6.5840/models"
+	"6.5840/porcupine"
+)
 
 const linearizabilityCheckTimeout = 1 * time.Second
 
@@ -38,9 +42,11 @@ func TestStaticShards5A(t *testing.T) {
 	for i := 0; i < n; i++ {
 		ka[i] = strconv.Itoa(i) // ensure multiple shards
 		va[i] = randstring(20)
+		logger.Info(logger.LT_Test, "Attempt to Put<%v, %v>\n", ka[i], va[i])
 		ck.Put(ka[i], va[i])
 	}
 	for i := 0; i < n; i++ {
+		logger.Info(logger.LT_Test, "Attempt to check<%v, %v>\n", ka[i], va[i])
 		check(t, ck, ka[i], va[i])
 	}
 
@@ -757,7 +763,13 @@ func TestUnreliable3_5B(t *testing.T) {
 				out = models.KvOutput{Value: v}
 			}
 			end := int64(time.Since(begin))
-			op := porcupine.Operation{Input: inp, Call: start, Output: out, Return: end, ClientId: i}
+			op := porcupine.Operation{
+				Input:    inp,
+				Call:     start,
+				Output:   out,
+				Return:   end,
+				ClientId: i,
+			}
 			opMu.Lock()
 			operations = append(operations, op)
 			opMu.Unlock()
@@ -788,7 +800,11 @@ func TestUnreliable3_5B(t *testing.T) {
 		<-ch
 	}
 
-	res, info := porcupine.CheckOperationsVerbose(models.KvModel, operations, linearizabilityCheckTimeout)
+	res, info := porcupine.CheckOperationsVerbose(
+		models.KvModel,
+		operations,
+		linearizabilityCheckTimeout,
+	)
 	if res == porcupine.Illegal {
 		file, err := ioutil.TempFile("", "*.html")
 		if err != nil {

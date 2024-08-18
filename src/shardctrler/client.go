@@ -4,14 +4,23 @@ package shardctrler
 // Shardctrler clerk.
 //
 
-import "6.5840/labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
+
+	"6.5840/labrpc"
+	"6.5840/logger"
+)
+
+var idCounter int = 0
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	me          int
+	leader      int
+	nextOpSeqno int
 }
 
 func nrand() int64 {
@@ -21,17 +30,31 @@ func nrand() int64 {
 	return x
 }
 
+func allocateClerkID() int {
+	// 其实应该用一个锁
+	idCounter++
+	return idCounter - 1
+}
+
+func (ck *Clerk) allocateOpSeqno() int {
+	ck.nextOpSeqno++
+	return ck.nextOpSeqno - 1
+}
+
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.me = allocateClerkID()
+	ck.leader = 0
+	ck.nextOpSeqno = 0
+	scLogger.Debug(logger.LT_CtrlClerk, "%%%d: Clerk generated\n", ck.me)
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
+	args := &QueryArgs{ClerkId: ck.me, OpSeqno: ck.allocateOpSeqno(), Num: num}
 	// Your code here.
-	args.Num = num
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -46,9 +69,8 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
+	args := &JoinArgs{ClerkId: ck.me, OpSeqno: ck.allocateOpSeqno(), Servers: servers}
 	// Your code here.
-	args.Servers = servers
 
 	for {
 		// try each known server.
@@ -64,9 +86,8 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
+	args := &LeaveArgs{ClerkId: ck.me, OpSeqno: ck.allocateOpSeqno(), GIDs: gids}
 	// Your code here.
-	args.GIDs = gids
 
 	for {
 		// try each known server.
@@ -82,10 +103,8 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
+	args := &MoveArgs{ClerkId: ck.me, OpSeqno: ck.allocateOpSeqno(), Shard: shard, GID: gid}
 	// Your code here.
-	args.Shard = shard
-	args.GID = gid
 
 	for {
 		// try each known server.

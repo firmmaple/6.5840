@@ -8,11 +8,17 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
-import "6.5840/shardctrler"
-import "time"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
+
+	"6.5840/labrpc"
+	"6.5840/logger"
+	"6.5840/shardctrler"
+)
+
+var idCounter int = 0
 
 // which shard is a key in?
 // please use this function,
@@ -38,6 +44,20 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	me          int
+	leader      int
+	nextOpSeqno []int
+}
+
+func allocateClerkID() int {
+	idCounter++
+	return idCounter - 1
+}
+
+func (ck *Clerk) allocateOpSeqno(shard int) int {
+	ck.nextOpSeqno[shard]++
+	kvLogger.Debug(logger.LT_CLERK, "%%%d: allocate shard %d\n", ck.me, ck.nextOpSeqno[shard]-1)
+	return ck.nextOpSeqno[shard] - 1
 }
 
 // the tester calls MakeClerk.
@@ -52,6 +72,10 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.me = allocateClerkID()
+	ck.leader = 0
+	ck.nextOpSeqno = make([]int, NShards)
+	kvLogger.Debug(logger.LT_CLERK, "%%%d: Clerk generated\n", ck.me)
 	return ck
 }
 
@@ -60,11 +84,10 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	shard := key2shard(key)
+	args := GetArgs{Key: key, ClerkId: ck.me, OpSeqno: ck.allocateOpSeqno(shard)}
 
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
@@ -92,19 +115,21 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
+	shard := key2shard(key)
+	args := PutAppendArgs{
+		Key: key, Value: value, Op: op, ClerkId: ck.me, OpSeqno: ck.allocateOpSeqno(shard),
+	}
 
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
+				kvLogger.Trace(
+					logger.LT_CLERK, "%%%d attempt to sent(shard %d) to %v\n",
+					ck.me, shard, servers[si],
+				)
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
 					return
@@ -112,6 +137,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok && reply.Err == ErrWrongGroup {
 					break
 				}
+				kvLogger.Trace(logger.LT_CLERK, "%%%d: sent to %v failed\n", ck.me, servers[si])
 				// ... not ok, or ErrWrongLeader
 			}
 		}
@@ -124,6 +150,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
+
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
 }
