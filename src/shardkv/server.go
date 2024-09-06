@@ -1,9 +1,7 @@
 package shardkv
 
 import (
-	"bytes"
 	"fmt"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +17,7 @@ const (
 	checkIsLeaderIntervalMs = 1000
 	noopTickIntervalMs      = 1500
 	snapshotRatio           = 0.9
+	pollIntervialMS         = 10
 )
 
 type OpType int
@@ -28,47 +27,67 @@ const (
 	OP_PUT
 	OP_APPEND
 	OP_NOOP
+	OP_START_CONFIG
+	OP_END_CONFIG
+	OP_INSTALL_SHARD
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	ClerkId int // 发起此操作的 Clerk 的 ID
-	Seqno   int // 此操作在该 Clerk 中的序列号（从 0 开始）
-	Shard   int
-	Type    OpType
-	Key     string
-	Value   string
+	ClerkId     int // 发起此操作的 Clerk 的 ID
+	Seqno       int // 此操作在该 Clerk 中的序列号（从 0 开始）
+	Shard       int
+	Type        OpType
+	Key         string
+	Value       string
+	NewConfig   shardctrler.Config // OP_START_CONFIG
+	ShardVers   int                // OP_INSTALL_SHARD
+	ShardData   map[string]string  // OP_INSTALL_SHARD
+	NextOpSeqno map[int]int        // OP_INSTALL_SHARD
 }
 
 func (op Op) String() string {
-	var opType string
+	opType, detail := "Unknow OpType", ""
 	switch op.Type {
 	case OP_GET:
 		opType = "GET"
+		detail = fmt.Sprintf("Key: %v", op.Key)
 	case OP_PUT:
 		opType = "PUT"
+		detail = fmt.Sprintf("Key: %v, Value: %v", op.Key, op.Value)
 	case OP_APPEND:
 		opType = "Append"
+		detail = fmt.Sprintf("Key: %v, Value: %v", op.Key, op.Value)
 	case OP_NOOP:
-		opType = "NoOp"
-	default:
-		opType = "Unknow OpType"
+		return "NoOp<>"
+	case OP_START_CONFIG:
+		return fmt.Sprintf(
+			"StartConfig<ConfigNum: %d, Shards: %v>",
+			op.NewConfig.Num, op.NewConfig.Shards,
+		)
+	case OP_END_CONFIG:
+		opType = "EndConfig"
+	case OP_INSTALL_SHARD:
+		return fmt.Sprintf(
+			"InstallShard<Shard: %v, Vers: %v>",
+			op.Shard, op.ShardVers,
+		)
 	}
+
 	return fmt.Sprintf(
-		"%v<Seqno: %d, Shard: %d, ClerkId: %d, Key: %v, Value: %v>",
-		opType, op.Seqno, op.Shard, op.ClerkId, op.Key, op.Value,
+		"%v<Seqno: %d, Shard: %d, ClerkId: %d, %v>", opType, op.Seqno, op.Shard, op.ClerkId, detail,
 	)
 }
 
 type identification struct {
-	gid int
-	me  int
+	Gid int
+	Me  int
 }
 
 func (id identification) String() string {
-	return fmt.Sprintf("%%%d-%d", id.gid, id.me)
+	return fmt.Sprintf("%%%d-%d", id.Gid, id.Me)
 }
 
 type Notifier struct {
@@ -78,6 +97,11 @@ type Notifier struct {
 
 func (n Notifier) notify() {
 	n.cond.Broadcast()
+}
+
+type ShardDB struct {
+	db   map[string]string
+	vers int
 }
 
 type ShardKV struct {
@@ -92,13 +116,17 @@ type ShardKV struct {
 
 	// Your definitions here.
 	id          identification
-	config      shardctrler.Config
+	curConfig   shardctrler.Config
+	nextConfig  shardctrler.Config
 	dead        int32 // set by Kill()
 	sm          *shardctrler.Clerk
 	persister   *raft.Persister
 	nextOpSeqno [NShards]map[int]int // 下一个待执行的Op序列号 shard -> (clerkid -> Seqno)
 	notifiers   map[int]Notifier     // Op执行完毕后，通过对应的notifier通知Clerk
-	data        map[string]string    // 存储KV键值对
+	// data          map[string]string    // 存储KV键值对
+	shardDBs      [NShards]ShardDB
+	inTransition  bool
+	servingShards []int
 }
 
 func (kv *ShardKV) isLeader() bool {
@@ -107,56 +135,45 @@ func (kv *ShardKV) isLeader() bool {
 }
 
 func (kv *ShardKV) isExecuted(op *Op) bool {
+	if op.ClerkId == -1 {
+		return false
+	}
 	return op.Seqno < kv.nextOpSeqno[op.Shard][op.ClerkId]
 }
 
-// createSnapshot建一个快照，该快照包含直至commandIndex的所有状态变更
-func (kv *ShardKV) createSnapshot(commandIndex int) {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	if e.Encode(kv.nextOpSeqno) != nil || e.Encode(kv.data) != nil {
-		kvLogger.Errorln(logger.LT_Persist, "Failed to encode some fields")
+func (kv *ShardKV) isTransitionFinished() bool {
+	for _, shard := range kv.servingShards {
+		if kv.shardDBs[shard].vers != kv.nextConfig.Num {
+			kvLogger.Info(
+				logger.LT_Shard,
+				"shard: %d,%v != %v\n",
+				shard,
+				kv.shardDBs[shard].vers,
+				kv.nextConfig.Num,
+			)
+			return false
+		}
 	}
-
-	kv.rf.Snapshot(commandIndex, w.Bytes())
-	kvLogger.Trace(
-		logger.LT_Persist, "%v made a snapshot up to commandIndex %d\n",
-		kv.id, commandIndex,
-	)
+	return true
 }
 
-// applySnapshot 加载并应用快照到当前状态，适用于以下场景：
-//  1. server重启时调用applySnapshot，从已有的快照中恢复状态。
-//  2. server调用createSnapshot创建快照后，收到Raft的ApplyMsg，
-//     然后再调用applySnapshot，确认快照以生成，无任何状态变化
-//  3. 当server的日志落后于leader时，leader发出InstallSnapshot更新快照，
-//     raft将接受到的快照通过ApplyMsg传递给server，
-//     然后通过server通过applySnapshot更新快照，实现server间的快照同步
-func (kv *ShardKV) applySnapshot(snapshot []byte) {
-	if snapshot == nil || len(snapshot) < 1 {
-		kvLogger.Trace(logger.LT_Persist, "%v bootstrap without snapshot\n", kv.id)
-		return
-	}
-	r := bytes.NewBuffer(snapshot)
-	d := labgob.NewDecoder(r)
-
-	if d.Decode(&kv.nextOpSeqno) != nil || d.Decode(&kv.data) != nil {
-		kvLogger.Errorln(logger.LT_Persist, "Failed to decode some fields")
-	}
-
-	kvLogger.Trace(logger.LT_Persist, "%v recovered from snapshot\n", kv.id)
+// return true if op is GET, PUT or Append
+func (kv *ShardKV) isClientComamnd(op *Op) bool {
+	return op.ClerkId != -1
 }
 
 func (kv *ShardKV) submitOpAndWait(opPtr *Op) (Err, string) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	_, _, isLeader := kv.rf.Start(*opPtr) // 将操作提交到 Raft，尝试在服务器间达成一致
+	// 将操作提交到 Raft，尝试在服务器间达成一致
+	_, _, isLeader := kv.rf.Start(*opPtr)
 	if !isLeader {
 		return ErrWrongLeader, ""
 	}
 	kvLogger.Debug(
-		logger.LT_SERVER, "%v handling %v from clerk %%%d\n", kv.id, opPtr, opPtr.ClerkId,
+		logger.LT_SERVER, "%v handling %v from clerk %%%d\n",
+		kv.id, opPtr, opPtr.ClerkId,
 	)
 
 	awakend := false // 用于标记操作是否成功提交并被唤醒
@@ -182,7 +199,7 @@ func (kv *ShardKV) submitOpAndWait(opPtr *Op) (Err, string) {
 		return ErrLeaderChange, ""
 	}
 
-	return OK, kv.data[opPtr.Key]
+	return OK, kv.shardDBs[key2shard(opPtr.Key)].db[opPtr.Key]
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -192,14 +209,18 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	reply.Err = OK
 	kv.mu.Lock()
-	if kv.config.Shards[opPtr.Shard] != kv.gid {
+	if kv.inTransition {
+		reply.Err = ErrInTransition
+		kv.mu.Unlock()
+		return
+	} else if kv.curConfig.Shards[opPtr.Shard] != kv.gid {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
 	} else if kv.isExecuted(opPtr) {
 		// Get第一次执行的时间 < 中间执行了0或多个命令 < 重复的Get到达时间
 		// 所以尽管当前Server可能的数据可能是Stale的，但是直接返回仍然符合linearizable
-		reply.Value = kv.data[args.Key]
+		reply.Value = kv.shardDBs[key2shard(args.Key)].db[args.Key]
 		kv.mu.Unlock()
 		return
 	}
@@ -211,7 +232,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	opType := OP_PUT
-	if opType == OP_APPEND {
+	if args.Op == "Append" {
 		opType = OP_APPEND
 	}
 	opPtr := &Op{
@@ -219,7 +240,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	reply.Err = OK
 	kv.mu.Lock()
-	if kv.config.Shards[opPtr.Shard] != kv.gid {
+	if kv.inTransition {
+		reply.Err = ErrInTransition
+		kv.mu.Unlock()
+		return
+	} else if kv.curConfig.Shards[opPtr.Shard] != kv.gid {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
@@ -230,72 +255,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 
 	reply.Err, _ = kv.submitOpAndWait(opPtr)
-}
-
-func (kv *ShardKV) applyCommand(op Op, commandIndex int) {
-	switch op.Type {
-	case OP_GET: // GET 操作不修改数据，因此无需处理
-	case OP_PUT:
-		kv.data[op.Key] = op.Value
-	case OP_APPEND:
-		originalValue, ok := kv.data[op.Key]
-		if !ok {
-			originalValue = ""
-		}
-		kv.data[op.Key] = originalValue + op.Value
-	default:
-		kvLogger.Error(logger.LT_SERVER, "%v: Unknow Op Type %d\n", kv.id, op.Type)
-	}
-	kvLogger.Debug(logger.LT_SERVER, "%v executed OP %v\n", kv.id, op)
-	if kv.nextOpSeqno[op.Shard][op.ClerkId] != op.Seqno { // 检查操作的序列号是否与预期一致，以防止操作顺序出错
-		kvLogger.Error(
-			logger.LT_SERVER, "%v: expected next op seqno of <%d, %%%d>: %d, but get %d \n",
-			kv.id, op.Shard, op.ClerkId, kv.nextOpSeqno[op.Shard][op.ClerkId], op.Seqno,
-		)
-	}
-	kv.nextOpSeqno[op.Shard][op.ClerkId]++ // 更新下一个预期执行的操作序列号
-	kvLogger.Debug(
-		logger.LT_SERVER, "%v updated nextOpSeqno of <%d, %%%d> to %d(CommandIndex: %v)\n",
-		kv.id, op.Shard, op.ClerkId, kv.nextOpSeqno[op.Shard][op.ClerkId], commandIndex,
-	)
-
-	notification, ok := kv.notifiers[op.ClerkId]
-	if ok && op.Seqno == notification.expectedSeqno {
-		// 如果当前操作的序列号与预期的相符，则唤醒等待的 goroutine。
-		// 这一步防止了因为旧操作未完成而提前唤醒等待的新操作的风险。
-		// 具体而言，假设此刻Clerk %2请求执行Get命令(seqno 100)，server成功接受命令，
-		// 但是在执行前Get命令前所有server都奔溃了。
-		// server从崩溃恢复后会从头执行所有日志中的命令，然后问题就会出现，
-		// 执行Clerk %2的第一个旧操作（seqno 0）时，会把等待Get命令(seqno 100)的Clerk 2唤醒，相当于提前执行的Get命令
-		notification.notify()
-	}
-}
-
-// executor 是 KVServer 的执行线程，它不断从 applyCh 中读取 Raft 的 ApplyMsg。
-// 根据 ApplyMsg 的类型，executor 会执行对应的操作（如更新状态机或应用快照）。
-func (kv *ShardKV) executor() {
-	// Raft被Kill时会关闭applyCh，因此executor线程可以正常退出
-	for applyMsg := range kv.applyCh {
-		kv.mu.Lock()
-		if applyMsg.SnapshotValid { // 如果收到的是有效的快照，则应用该快照来恢复状态
-			kv.applySnapshot(applyMsg.Snapshot)
-		} else if applyMsg.CommandValid { // 如果收到的是有效的命令，则尝试将命令转换为 Op 类型并执行
-			op, ok := applyMsg.Command.(Op) // 尝试将 Command 断言为 Op 类型
-			if !ok {
-				actualType := reflect.TypeOf(applyMsg.Command)
-				kvLogger.Error(
-					logger.LT_SERVER, "%v: Command is not of type *Op, actual type: %v\n",
-					kv.id, actualType,
-				)
-			}
-			if op.Type == OP_NOOP || kv.isExecuted(&op) {
-				// 如果是 NOOP 操作或者操作已经执行过，则不做任何处理
-			} else {
-				kv.applyCommand(op, applyMsg.CommandIndex)
-			}
-		}
-		kv.mu.Unlock()
-	}
 }
 
 // noopTicker 定期向leader发送一个空的日志条目(noopTicker)
@@ -321,20 +280,13 @@ func (kv *ShardKV) executor() {
 func (kv *ShardKV) noopTicker() {
 	for !kv.killed() {
 		if kv.isLeader() {
-			op := Op{Type: OP_NOOP}
+			kv.mu.Lock()
+			kvLogger.Debug(logger.LT_Shard, "%v intransition: %v\n", kv.id, kv.inTransition)
+			kv.mu.Unlock()
+			op := Op{Type: OP_NOOP, ClerkId: -1}
 			kv.rf.Start(op)
 		}
 		time.Sleep(noopTickIntervalMs * time.Millisecond)
-	}
-}
-
-func (kv *ShardKV) getLatestConfig() {
-	for !kv.killed() {
-		latestConfig := kv.sm.Query(-1)
-		kv.mu.Lock()
-		kv.config = latestConfig
-		kv.mu.Unlock()
-		time.Sleep(1000 * time.Millisecond)
 	}
 }
 
@@ -394,20 +346,26 @@ func StartServer(
 	kv.gid = gid
 	kv.ctrlers = ctrlers
 	// Your initialization code here.
-	kv.id = identification{gid: gid, me: me}
-	kv.data = make(map[string]string)
+	kv.id = identification{Gid: gid, Me: me}
 	for i := 0; i < len(kv.nextOpSeqno); i++ {
 		kv.nextOpSeqno[i] = make(map[int]int)
 	}
 	kv.notifiers = make(map[int]Notifier)
+	kv.servingShards = make([]int, 0)
+	for shard := 0; shard < NShards; shard++ {
+		kv.shardDBs[shard].db = make(map[string]string)
+		kv.shardDBs[shard].vers = 0
+		kv.servingShards = append(kv.servingShards, shard)
+	}
 
 	// Use something like this to talk to the shardctrler:
 	kv.sm = shardctrler.MakeClerk(kv.ctrlers)
 	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.inTransition = false
 
-	go kv.getLatestConfig()
+	go kv.configPoller()
 	go kv.executor()
 	go kv.noopTicker()
 

@@ -49,6 +49,7 @@ const (
 	LT_CtrlServer LogTopic = "CTRL_SR"
 	LT_CtrlClerk  LogTopic = "CTRL_CK"
 	LT_Rebalance  LogTopic = "REBA"
+  LT_Shard      LogTopic = "SHRD"
 )
 
 type Logger struct {

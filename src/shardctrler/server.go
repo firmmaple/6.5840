@@ -115,18 +115,13 @@ func (sc *ShardCtrler) isExecuted(op *Op) bool {
 	return op.Seqno < sc.nextOpSeqno[op.ClerkId]
 }
 
-func (sc *ShardCtrler) lastConfig() Config {
-	return sc.configs[len(sc.configs)-1]
-}
-
-func (sc *ShardCtrler) cloneLastConfig() Config {
-	lastConfig := sc.configs[len(sc.configs)-1]
+func (sc *ShardCtrler) CloneConfig(config *Config) Config {
 	newConfig := Config{
-		Num:    lastConfig.Num,
-		Shards: lastConfig.Shards, // 数组是值类型，因此可以直接赋值
+		Num:    config.Num,
+		Shards: config.Shards, // 数组是值类型，因此可以直接赋值
 		Groups: make(map[int][]string),
 	}
-	for gid, servers := range lastConfig.Groups {
+	for gid, servers := range config.Groups {
 		newServers := make([]string, len(servers))
 		copy(newServers, servers)
 		newConfig.Groups[gid] = newServers
@@ -210,7 +205,10 @@ func (sc *ShardCtrler) rebalance(newConfig *Config) {
 			underAssigned.shards = append(underAssigned.shards, nextShard) // 无意义，只是由于之后打印infos
 		}
 	}
-	scLogger.Info(logger.LT_Rebalance, "%%%d: after rebalance groupShardInfos %v\n", sc.me, infos)
+	scLogger.Info(
+		logger.LT_Rebalance, "%%%d: Config Num %d - rebalance groupShardInfos %v\n",
+		sc.me, newConfig.Num, infos,
+	)
 }
 
 func (kv *ShardCtrler) createSnapshot(commandIndex int) {
@@ -227,7 +225,7 @@ func (sc *ShardCtrler) submitOpAndWait(opPtr *Op) (bool, Err) {
 	if !isLeader {
 		return true, ErrWrongLeader
 	}
-	scLogger.Debug(
+	scLogger.Trace(
 		logger.LT_CtrlServer, "%%%d handling %v from clerk %%%d\n",
 		sc.me, opPtr, opPtr.ClerkId,
 	)
@@ -266,10 +264,6 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	}
 	reply.Err = OK
 	sc.mu.Lock()
-	// scLogger.Debug(
-	// 	logger.LT_CtrlServer, "%%%d received %v from clerk %%%d\n",
-	// 	sc.me, op, args.ClerkId,
-	// )
 	if sc.isExecuted(op) {
 		sc.mu.Unlock()
 		return
@@ -286,10 +280,6 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	}
 	reply.Err = OK
 	sc.mu.Lock()
-	// scLogger.Debug(
-	// 	logger.LT_CtrlServer, "%%%d received %v from clerk %%%d\n",
-	// 	sc.me, op, args.ClerkId,
-	// )
 	if sc.isExecuted(op) {
 		sc.mu.Unlock()
 		return
@@ -306,10 +296,6 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	}
 	reply.Err = OK
 	sc.mu.Lock()
-	// scLogger.Debug(
-	// 	logger.LT_CtrlServer, "%%%d received %v from clerk %%%d\n",
-	// 	sc.me, op, args.ClerkId,
-	// )
 	if sc.isExecuted(op) {
 		sc.mu.Unlock()
 		return
@@ -326,10 +312,6 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	}
 	reply.Err = OK
 	sc.mu.Lock()
-	// scLogger.Debug(
-	// 	logger.LT_CtrlServer, "%%%d received %v from clerk %%%d\n",
-	// 	sc.me, op, args.ClerkId,
-	// )
 	if sc.isExecuted(op) {
 		sc.mu.Unlock()
 		return
@@ -347,9 +329,10 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 // applyCommand 执行指定的操作（op），并在操作执行后通知相关的 goroutine 该操作已完成
 func (sc *ShardCtrler) applyCommand(op Op, commandIndex int) {
+	lastConfig := &sc.configs[len(sc.configs)-1]
 	switch op.Type {
 	case OP_JOIN:
-		newConfig := sc.cloneLastConfig()
+		newConfig := sc.CloneConfig(lastConfig)
 		newConfig.Num++
 		for gid, servers := range op.Servers {
 			if _, isExisted := newConfig.Groups[gid]; isExisted {
@@ -364,7 +347,7 @@ func (sc *ShardCtrler) applyCommand(op Op, commandIndex int) {
 		sc.rebalance(&newConfig)
 		sc.configs = append(sc.configs, newConfig)
 	case OP_LEAVE:
-		newConfig := sc.cloneLastConfig()
+		newConfig := sc.CloneConfig(lastConfig)
 		newConfig.Num++
 		for _, gid := range op.GIDs {
 			if _, isExisted := newConfig.Groups[gid]; !isExisted {
@@ -384,7 +367,7 @@ func (sc *ShardCtrler) applyCommand(op Op, commandIndex int) {
 		sc.rebalance(&newConfig)
 		sc.configs = append(sc.configs, newConfig)
 	case OP_MOVE:
-		newConfig := sc.cloneLastConfig()
+		newConfig := sc.CloneConfig(lastConfig)
 		newConfig.Num++
 		newConfig.Shards[op.Shard] = op.GID
 		sc.configs = append(sc.configs, newConfig)
@@ -392,7 +375,11 @@ func (sc *ShardCtrler) applyCommand(op Op, commandIndex int) {
 	default:
 		scLogger.Error(logger.LT_CtrlServer, "%%%d: Unknow Op Type %d\n", sc.me, op.Type)
 	}
-	scLogger.Info(logger.LT_CtrlServer, "%%%d executed %v\n", sc.me, op)
+	debugFunc := scLogger.Debug
+	if op.Type == OP_QUERY {
+		debugFunc = scLogger.Trace
+	}
+	debugFunc(logger.LT_CtrlServer, "%%%d executed %v\n", sc.me, op)
 	if sc.nextOpSeqno[op.ClerkId] != op.Seqno { // 检查操作的序列号是否与预期一致，以防止操作顺序出错
 		scLogger.Error(
 			logger.LT_CtrlServer, "%%%d: nextOpSeqno %d != op.Seqno %d \n",
@@ -400,7 +387,7 @@ func (sc *ShardCtrler) applyCommand(op Op, commandIndex int) {
 		)
 	}
 	sc.nextOpSeqno[op.ClerkId]++ // 更新下一个预期执行的操作序列号
-	scLogger.Debug(
+	debugFunc(
 		logger.LT_CtrlServer, "%%%d updated nextOpSeqno of %%%d to %d(CommandIndex: %v)\n",
 		sc.me, op.ClerkId, sc.nextOpSeqno[op.ClerkId], commandIndex,
 	)

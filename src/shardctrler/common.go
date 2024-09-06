@@ -41,8 +41,8 @@ const (
 )
 
 // var scLogger = logger.NewLogger(logger.LL_TRACE, os.Stdout, "SHARD")
-// var scLogger = logger.NewLogger(logger.LL_DEBUG, os.Stdout, "SHARD")
-var scLogger = logger.NewLogger(logger.LL_INFO, os.Stdout, "SHARD")
+var scLogger = logger.NewLogger(logger.LL_DEBUG, os.Stdout, "SHARD")
+// var scLogger = logger.NewLogger(logger.LL_INFO, os.Stdout, "SHARD")
 
 type Err string
 

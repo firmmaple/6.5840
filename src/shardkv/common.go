@@ -23,6 +23,8 @@ const (
 	ErrWrongGroup   = "ErrWrongGroup"
 	ErrWrongLeader  = "ErrWrongLeader"
 	ErrLeaderChange = "ErrLeaderChange"
+	WaitForUpdate   = "WaitForUpdate"
+	ErrInTransition = "InTransition"
 )
 
 var kvLogger = logger.NewLogger(logger.LL_TRACE, os.Stdout, "SHARD")

@@ -56,7 +56,6 @@ func allocateClerkID() int {
 
 func (ck *Clerk) allocateOpSeqno(shard int) int {
 	ck.nextOpSeqno[shard]++
-	kvLogger.Debug(logger.LT_CLERK, "%%%d: allocate shard %d\n", ck.me, ck.nextOpSeqno[shard]-1)
 	return ck.nextOpSeqno[shard] - 1
 }
 
@@ -101,6 +100,15 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
 				}
+				kvLogger.Trace(
+					logger.LT_CLERK,
+					"%%%d: sent to %v failed(ok: %v, err: %v)\n",
+					ck.me, servers[si], ok, reply.Err,
+				)
+				if ok && reply.Err == ErrInTransition {
+					si -= 1
+					time.Sleep(100 * time.Millisecond)
+				}
 				// ... not ok, or ErrWrongLeader
 			}
 		}
@@ -127,8 +135,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				kvLogger.Trace(
-					logger.LT_CLERK, "%%%d attempt to sent(shard %d) to %v\n",
-					ck.me, shard, servers[si],
+					logger.LT_CLERK,
+					"%%%v attempt to %v<Key %v(shard %d), Value: %v> to %v\n",
+					ck.me, op, key, shard, value, servers[si],
 				)
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
@@ -137,7 +146,15 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok && reply.Err == ErrWrongGroup {
 					break
 				}
-				kvLogger.Trace(logger.LT_CLERK, "%%%d: sent to %v failed\n", ck.me, servers[si])
+				kvLogger.Trace(
+					logger.LT_CLERK,
+					"%%%d: sent to %v failed(ok: %v, err: %v)\n",
+					ck.me, servers[si], ok, reply.Err,
+				)
+				if ok && reply.Err == ErrInTransition {
+					si -= 1
+					time.Sleep(100 * time.Millisecond)
+				}
 				// ... not ok, or ErrWrongLeader
 			}
 		}
