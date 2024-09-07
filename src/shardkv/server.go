@@ -100,8 +100,8 @@ func (n Notifier) notify() {
 }
 
 type ShardDB struct {
-	db   map[string]string
-	vers int
+	Db   map[string]string
+	Vers int
 }
 
 type ShardKV struct {
@@ -125,7 +125,6 @@ type ShardKV struct {
 	notifiers   map[int]Notifier     // Op执行完毕后，通过对应的notifier通知Clerk
 	// data          map[string]string    // 存储KV键值对
 	shardDBs      [NShards]ShardDB
-	inTransition  bool
 	servingShards []int
 }
 
@@ -141,14 +140,18 @@ func (kv *ShardKV) isExecuted(op *Op) bool {
 	return op.Seqno < kv.nextOpSeqno[op.Shard][op.ClerkId]
 }
 
+func (kv *ShardKV) isInTransition() bool {
+	return kv.curConfig.Num+1 == kv.nextConfig.Num
+}
+
 func (kv *ShardKV) isTransitionFinished() bool {
 	for _, shard := range kv.servingShards {
-		if kv.shardDBs[shard].vers != kv.nextConfig.Num {
+		if kv.shardDBs[shard].Vers != kv.nextConfig.Num {
 			kvLogger.Info(
 				logger.LT_Shard,
 				"shard: %d,%v != %v\n",
 				shard,
-				kv.shardDBs[shard].vers,
+				kv.shardDBs[shard].Vers,
 				kv.nextConfig.Num,
 			)
 			return false
@@ -199,7 +202,7 @@ func (kv *ShardKV) submitOpAndWait(opPtr *Op) (Err, string) {
 		return ErrLeaderChange, ""
 	}
 
-	return OK, kv.shardDBs[key2shard(opPtr.Key)].db[opPtr.Key]
+	return OK, kv.shardDBs[key2shard(opPtr.Key)].Db[opPtr.Key]
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -209,7 +212,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	reply.Err = OK
 	kv.mu.Lock()
-	if kv.inTransition {
+	if kv.isInTransition() {
 		reply.Err = ErrInTransition
 		kv.mu.Unlock()
 		return
@@ -220,7 +223,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	} else if kv.isExecuted(opPtr) {
 		// Get第一次执行的时间 < 中间执行了0或多个命令 < 重复的Get到达时间
 		// 所以尽管当前Server可能的数据可能是Stale的，但是直接返回仍然符合linearizable
-		reply.Value = kv.shardDBs[key2shard(args.Key)].db[args.Key]
+		reply.Value = kv.shardDBs[key2shard(args.Key)].Db[args.Key]
 		kv.mu.Unlock()
 		return
 	}
@@ -240,7 +243,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	reply.Err = OK
 	kv.mu.Lock()
-	if kv.inTransition {
+	if kv.isInTransition() {
 		reply.Err = ErrInTransition
 		kv.mu.Unlock()
 		return
@@ -281,7 +284,7 @@ func (kv *ShardKV) noopTicker() {
 	for !kv.killed() {
 		if kv.isLeader() {
 			kv.mu.Lock()
-			kvLogger.Debug(logger.LT_Shard, "%v intransition: %v\n", kv.id, kv.inTransition)
+			kvLogger.Debug(logger.LT_Shard, "%v intransition: %v\n", kv.id, kv.isInTransition())
 			kv.mu.Unlock()
 			op := Op{Type: OP_NOOP, ClerkId: -1}
 			kv.rf.Start(op)
@@ -347,15 +350,14 @@ func StartServer(
 	kv.ctrlers = ctrlers
 	// Your initialization code here.
 	kv.id = identification{Gid: gid, Me: me}
-	for i := 0; i < len(kv.nextOpSeqno); i++ {
-		kv.nextOpSeqno[i] = make(map[int]int)
-	}
+	kv.nextConfig = kv.curConfig
 	kv.notifiers = make(map[int]Notifier)
 	kv.servingShards = make([]int, 0)
 	for shard := 0; shard < NShards; shard++ {
-		kv.shardDBs[shard].db = make(map[string]string)
-		kv.shardDBs[shard].vers = 0
+		kv.shardDBs[shard].Db = make(map[string]string)
+		kv.shardDBs[shard].Vers = 0
 		kv.servingShards = append(kv.servingShards, shard)
+		kv.nextOpSeqno[shard] = make(map[int]int)
 	}
 
 	// Use something like this to talk to the shardctrler:
@@ -363,7 +365,10 @@ func StartServer(
 	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.inTransition = false
+
+	if maxraftstate != -1 {
+		kv.applySnapshot(persister.ReadSnapshot())
+	}
 
 	go kv.configPoller()
 	go kv.executor()

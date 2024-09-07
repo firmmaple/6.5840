@@ -1,8 +1,10 @@
 package shardkv
 
 import (
+	"bytes"
 	"reflect"
 
+	"6.5840/labgob"
 	"6.5840/logger"
 )
 
@@ -37,38 +39,46 @@ func (kv *ShardKV) applyCommand(op *Op, commandIndex int) {
 	} else {
 		kv.applyServerCommand(op)
 	}
+	// 检查日志大小，并在达到阈值时创建快照，以防止日志无限增长
+	if kv.maxraftstate != -1 && // 如果 maxraftstate 为 -1，表示不需要创建快照
+		float32(kv.persister.RaftStateSize()) > float32(kv.maxraftstate)*snapshotRatio {
+		kv.createSnapshot(commandIndex) // 创建快照以压缩日志大小
+	}
 }
 
 func (kv *ShardKV) applyServerCommand(op *Op) {
+	kvLogger.Debug(
+		logger.LT_SERVER, "%v: curConfig num: %d, op config num: %d\n",
+		kv.id, kv.curConfig.Num, op.NewConfig.Num,
+	)
 	switch op.Type {
 	case OP_START_CONFIG:
 		if kv.curConfig.Num+1 > op.NewConfig.Num {
 			return
 		} else if kv.curConfig.Num+1 < op.NewConfig.Num {
 			kvLogger.Error(
-				logger.LT_SERVER, "%v: expected config num: %d, but get %d\n",
+				logger.LT_SERVER, "%v: expected cur config num: %d, but get %d\n",
 				kv.id, kv.curConfig.Num+1, op.NewConfig.Num,
 			)
 		}
 		kv.nextConfig = op.NewConfig
-		kv.inTransition = true
-		go kv.transitConfig(kv.nextConfig.Num)
+		kv.transitConfig(kv.nextConfig.Num)
 	case OP_INSTALL_SHARD:
 		if kv.nextConfig.Num > op.ShardVers+1 {
 			return
 		} else if kv.nextConfig.Num < op.ShardVers+1 {
 			kvLogger.Error(
-				logger.LT_SERVER, "%v: expected config num: %d, but get %d\n",
+				logger.LT_SERVER, "%v: expected next config num: %d, but get %d\n",
 				kv.id, kv.nextConfig.Num, op.ShardVers+1,
 			)
-		} else if kv.shardDBs[op.Shard].vers == kv.nextConfig.Num {
+		} else if kv.shardDBs[op.Shard].Vers == kv.nextConfig.Num {
 			kvLogger.Info(logger.LT_Test, "%v already have shard %d\n", kv.id, op.Shard)
 			// 已经获得这个shard了
 			return
 		}
 		// 将shard加入data
-		kv.shardDBs[op.Shard].db = getDBCopy(op.ShardData)
-		kv.shardDBs[op.Shard].vers = op.ShardVers + 1
+		kv.shardDBs[op.Shard].Db = getDBCopy(op.ShardData)
+		kv.shardDBs[op.Shard].Vers = op.ShardVers + 1
 		kv.nextOpSeqno[op.Shard] = getNextSeqnoCopy(op.NextOpSeqno)
 		kvLogger.Info(logger.LT_Shard, "%v now serving shard %d\n", kv.id, op.Shard)
 		if kv.isTransitionFinished() {
@@ -77,7 +87,6 @@ func (kv *ShardKV) applyServerCommand(op *Op) {
 				"%v: transit to %v finished(got all shards)\n",
 				kv.id, kv.nextConfig.Num,
 			)
-			kv.inTransition = false
 			kv.curConfig = kv.nextConfig
 		}
 	case OP_NOOP:
@@ -91,14 +100,14 @@ func (kv *ShardKV) applyClientCommand(op *Op, commandIndex int) {
 	switch op.Type {
 	case OP_GET: // GET 操作不修改数据，因此无需处理
 	case OP_PUT:
-		kv.shardDBs[key2shard(op.Key)].db[op.Key] = op.Value
+		kv.shardDBs[key2shard(op.Key)].Db[op.Key] = op.Value
 	case OP_APPEND:
-		originalValue, ok := kv.shardDBs[key2shard(op.Key)].db[op.Key]
+		originalValue, ok := kv.shardDBs[key2shard(op.Key)].Db[op.Key]
 		if !ok {
 			originalValue = ""
 			logger.Info(logger.LT_Test, "does not have original value\n")
 		}
-		kv.shardDBs[key2shard(op.Key)].db[op.Key] = originalValue + op.Value
+		kv.shardDBs[key2shard(op.Key)].Db[op.Key] = originalValue + op.Value
 	default:
 		kvLogger.Error(logger.LT_SERVER, "%v: Unknow Op Type %d\n", kv.id, op.Type)
 	}
@@ -131,30 +140,36 @@ func (kv *ShardKV) applyClientCommand(op *Op, commandIndex int) {
 
 // createSnapshot建一个快照，该快照包含直至commandIndex的所有状态变更
 func (kv *ShardKV) createSnapshot(commandIndex int) {
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// if e.Encode(kv.nextOpSeqno) != nil || e.Encode(kv.data) != nil {
-	// 	kvLogger.Errorln(logger.LT_Persist, "Failed to encode some fields")
-	// }
-	//
-	// kv.rf.Snapshot(commandIndex, w.Bytes())
-	// kvLogger.Trace(
-	// 	logger.LT_Persist, "%v made a snapshot up to commandIndex %d\n",
-	// 	kv.id, commandIndex,
-	// )
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.nextOpSeqno) != nil || e.Encode(kv.shardDBs) != nil ||
+		e.Encode(kv.curConfig) != nil || e.Encode(kv.nextConfig) != nil {
+		kvLogger.Errorln(logger.LT_Persist, "Failed to encode some fields")
+	}
+
+	kv.rf.Snapshot(commandIndex, w.Bytes())
+	kvLogger.Trace(
+		logger.LT_Persist, "%v made a snapshot up to commandIndex %d\n",
+		kv.id, commandIndex,
+	)
 }
 
 func (kv *ShardKV) applySnapshot(snapshot []byte) {
-	// if snapshot == nil || len(snapshot) < 1 {
-	// 	kvLogger.Trace(logger.LT_Persist, "%v bootstrap without snapshot\n", kv.id)
-	// 	return
-	// }
-	// r := bytes.NewBuffer(snapshot)
-	// d := labgob.NewDecoder(r)
-	//
-	// if d.Decode(&kv.nextOpSeqno) != nil || d.Decode(&kv.data) != nil {
-	// 	kvLogger.Errorln(logger.LT_Persist, "Failed to decode some fields")
-	// }
-	//
-	// kvLogger.Trace(logger.LT_Persist, "%v recovered from snapshot\n", kv.id)
+	if snapshot == nil || len(snapshot) < 1 {
+		kvLogger.Trace(logger.LT_Persist, "%v bootstrap without snapshot\n", kv.id)
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&kv.nextOpSeqno) != nil || d.Decode(&kv.shardDBs) != nil ||
+		d.Decode(&kv.curConfig) != nil || d.Decode(&kv.nextConfig) != nil {
+		kvLogger.Errorln(logger.LT_Persist, "Failed to decode some fields")
+	}
+
+	kvLogger.Trace(
+		logger.LT_Persist,
+		"%v recovered from snapshot(config num: %d)\n",
+		kv.id, kv.curConfig.Num,
+	)
 }

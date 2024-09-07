@@ -236,8 +236,7 @@ func (sc *ShardCtrler) submitOpAndWait(opPtr *Op) (bool, Err) {
 	go func() {
 		for { // 定期检查当前服务器是否仍然是 Leader，直到操作成功提交或失去领导权
 			<-time.After(time.Duration(checkIsLeaderIntervalMs) * time.Millisecond)
-			isLeader = sc.isLeader()
-			if !isLeader || awakend {
+			if !sc.isLeader() || awakend {
 				break
 			}
 		}
@@ -248,7 +247,7 @@ func (sc *ShardCtrler) submitOpAndWait(opPtr *Op) (bool, Err) {
 
 	notifier.cond.Wait()
 	awakend = true
-	if !isLeader {
+	if !sc.isLeader() {
 		scLogger.Debug(logger.LT_CtrlServer, "%%%d: leadership changed\n", sc.me)
 		return true, ErrLeaderChange
 	}
@@ -313,6 +312,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	reply.Err = OK
 	sc.mu.Lock()
 	if sc.isExecuted(op) {
+		reply.Config = sc.configs[args.Num]
 		sc.mu.Unlock()
 		return
 	}
@@ -320,7 +320,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 	reply.WrongLeader, reply.Err = sc.submitOpAndWait(op)
 	sc.mu.Lock()
-	if args.Num < 0 || args.Num > len(sc.configs) {
+	if args.Num < 0 || args.Num >= len(sc.configs) {
 		args.Num = len(sc.configs) - 1
 	}
 	reply.Config = sc.configs[args.Num]

@@ -65,7 +65,7 @@ func (kv *ShardKV) RequestShard(args *requestShardArgs, reply *requestShardReply
 	if args.VersRequest+1 > kv.nextConfig.Num {
 		kvLogger.Trace(
 			logger.LT_SERVER, "%v is less update(%d) than %%%v(%d), intransition: %v\n",
-			kv.id, kv.nextConfig.Num, args.Id, args.VersRequest+1, kv.inTransition,
+			kv.id, kv.nextConfig.Num, args.Id, args.VersRequest+1, kv.isInTransition(),
 		)
 		reply.Err = WaitForUpdate
 		return
@@ -85,17 +85,17 @@ func (kv *ShardKV) RequestShard(args *requestShardArgs, reply *requestShardReply
 		// }
 	}
 
-	if kv.shardDBs[args.Shard].vers != args.VersRequest {
+	if kv.shardDBs[args.Shard].Vers != args.VersRequest {
 		kvLogger.Debug(
 			logger.LT_SERVER,
 			"%v do not have vers %d of shard %d, only vers %d\n",
-			kv.id, args.VersRequest, args.Shard, kv.shardDBs[args.Shard].vers,
+			kv.id, args.VersRequest, args.Shard, kv.shardDBs[args.Shard].Vers,
 		)
 		reply.Err = ErrWrongGroup
 		return
 	}
 
-	reply.ShardDB = getDBCopy(kv.shardDBs[args.Shard].db)
+	reply.ShardDB = getDBCopy(kv.shardDBs[args.Shard].Db)
 	reply.NextOpSeqno = getNextSeqnoCopy(kv.nextOpSeqno[args.Shard])
 	reply.Err = OK
 }
@@ -119,9 +119,10 @@ func (kv *ShardKV) installShard(shard int) {
 			break
 		}
 		kvLogger.Debug(
-			logger.LT_Shard, "%v request shard (%v, %v) failed, try again\n",
-			kv.id, args.VersRequest, shard,
+			logger.LT_Shard, "%v request shard (%v, %v) failed(Ok: %v, Err: %v), try again\n",
+			kv.id, args.VersRequest, shard, ok, reply.Err,
 		)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	kv.mu.Lock()
@@ -151,9 +152,7 @@ func (kv *ShardKV) installShard(shard int) {
 }
 
 func (kv *ShardKV) transitConfig(configNum int) {
-	kv.mu.Lock()
 	if kv.nextConfig.Num > configNum {
-		kv.mu.Unlock()
 		return
 	}
 	curServingShards := kv.servingShards
@@ -164,7 +163,6 @@ func (kv *ShardKV) transitConfig(configNum int) {
 		}
 	}
 	kv.servingShards = nextServingShards
-	kv.mu.Unlock()
 
 	// todo vers不是最新的也需要trasnit
 	missingShards := make([]int, 0)
@@ -178,10 +176,10 @@ func (kv *ShardKV) transitConfig(configNum int) {
 			curIndex++
 		} else {
 			shard := curServingShards[curIndex]
-			if kv.shardDBs[shard].vers+1 == configNum {
+			if kv.shardDBs[shard].Vers+1 == configNum {
 				// 如果server拥有该shard的最新版本
 				// 则将更新shard version为下一config num
-				kv.shardDBs[shard].vers += 1
+				kv.shardDBs[shard].Vers += 1
 			} else {
 				// 如果server拥有该shard，但不是最新版本
 				missingShards = append(missingShards, shard)
@@ -190,24 +188,14 @@ func (kv *ShardKV) transitConfig(configNum int) {
 			nextIndex++
 		}
 	}
-	// kvLogger.Debug(
-	// 	logger.LT_Shard,
-	// 	"%v preServing shards: %v, curServing shards: %v\n",
-	// 	kv.id,
-	// 	preServeingShards,
-	// 	curServeingShards,
-	// )
 	if len(missingShards) == 0 {
-		kv.mu.Lock()
 		kvLogger.Debug(
 			logger.LT_Shard,
 			"%v: transit to %v finished(no missing shards)\n",
 			kv.id, kv.nextConfig.Num,
 		)
-		kv.inTransition = false
 		kv.curConfig = kv.nextConfig
-		kv.mu.Unlock()
-	} else {
+	} else if kv.isLeader() {
 		kvLogger.Debug(logger.LT_Shard, "%v: missing shards: %v\n", kv.id, missingShards)
 
 		for _, shard := range missingShards {
@@ -221,8 +209,8 @@ func (kv *ShardKV) configPoller() {
 	configQeueu := make([]shardctrler.Config, 0)
 	for !kv.killed() {
 		if kv.isLeader() {
-			kv.mu.Lock()
 			latestConfig := kv.sm.Query(-1)
+			kv.mu.Lock()
 			kvLogger.Debug(
 				logger.LT_Shard, "%v config num %d, latest config num %d\n",
 				kv.id, kv.curConfig.Num, latestConfig.Num,
@@ -238,25 +226,45 @@ func (kv *ShardKV) configPoller() {
 					logger.LT_Shard, "%v append latest config (num %v)\n",
 					kv.id, latestConfig.Num,
 				)
+			} else if lastConfig.Num+1 < latestConfig.Num {
+				// 获取中间缺失的config
+				kv.mu.Unlock()
+				for num := lastConfig.Num + 1; num <= latestConfig.Num; num++ {
+					nextConfig := kv.sm.Query(num)
+					if lastConfig.Num+1 != nextConfig.Num {
+						kvLogger.Debug(
+							logger.LT_Shard,
+							"%v last config num %d, fetched next config num %d\n",
+							kv.id, kv.curConfig.Num, latestConfig.Num,
+						)
+						break
+					}
+					kvLogger.Debug(
+						logger.LT_Shard, "%v append missing config (num %v)\n",
+						kv.id, nextConfig.Num,
+					)
+					configQeueu = append(configQeueu, nextConfig)
+					lastConfig = nextConfig
+				}
+				kv.mu.Lock()
 			}
 			// 如果上一个config已transit，transit下一个config
-			if kv.inTransition == false && len(configQeueu) != 0 {
+			if kv.isInTransition() == false && len(configQeueu) != 0 {
 				nextConfig := configQeueu[0]
 				configQeueu = configQeueu[1:]
 				kvLogger.Debug(
 					logger.LT_SERVER,
 					"%v submit new config %d\n",
-					kv.id, latestConfig.Num,
+					kv.id, nextConfig.Num,
 				)
 				op := Op{Type: OP_START_CONFIG, ClerkId: -1, NewConfig: nextConfig}
 				// todo 如果在这时候恰好发生了leadership change，是不是会出现问题
 				kv.rf.Start(op)
-				kv.inTransition = true
 			} else {
 				kvLogger.Debug(
 					logger.LT_Shard,
 					"%v cannot transit config(inTransition: %v, len(configQeueu): %v)\n",
-					kv.id, kv.inTransition, len(configQeueu),
+					kv.id, kv.isInTransition(), len(configQeueu),
 				)
 			}
 			kv.mu.Unlock()
